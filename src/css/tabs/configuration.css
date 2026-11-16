@@ -275,3 +275,84 @@ hr {
     margin-right: 72px;
     vertical-align: top;
 }
+
+/* VTX menus: table entries such as "5: HIGHBAND (H)" and "8: 6030 MHz" need more room than "Raceband" and "8" */
+.config-vtx .select select {
+    width: auto;
+    min-width: 12em;
+}
+
+/* VTX table editor (fork firmware with vtxtable support) */
+.config-vtxtable .vtxtable-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5em;
+    margin: 0.6em 0;
+}
+
+.config-vtxtable .vtxtable-actions .default_btn {
+    float: none;
+}
+
+.config-vtxtable .vtxtable-actions .default_btn a {
+    padding: 5px 10px;
+}
+
+.config-vtxtable .vtxtable-sizes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1.5em;
+    margin: 0.6em 0;
+}
+
+.config-vtxtable .vtxtable-sizes label {
+    display: flex;
+    align-items: center;
+    gap: 0.5em;
+}
+
+.config-vtxtable .vtxtable-sizes input {
+    width: 5ch;
+}
+
+.config-vtxtable .vtxtable-grid {
+    width: auto;
+    margin: 0.6em 0;
+    border-collapse: collapse;
+}
+
+/* The tab's own stylesheet hides table headers; this grid needs its column headings */
+.config-vtxtable .vtxtable-grid thead {
+    display: table-header-group;
+}
+
+.config-vtxtable .vtxtable-grid th {
+    font-weight: bold;
+}
+
+.config-vtxtable .vtxtable-grid th,
+.config-vtxtable .vtxtable-grid td {
+    padding: 2px 4px;
+    text-align: left;
+    white-space: nowrap;
+}
+
+.config-vtxtable .vtxtable-grid input[type="number"] {
+    width: 7ch;
+}
+
+.config-vtxtable .vtxtable-grid input.vtxtable-name {
+    width: 10ch;
+}
+
+.config-vtxtable .vtxtable-grid input.vtxtable-letter {
+    width: 3ch;
+}
+
+.config-vtxtable .vtxtable-grid input.vtxtable-powerlabel {
+    width: 7ch;
+}
+
+.config-vtxtable #vtxtable_editor {
+    overflow-x: auto;
+}

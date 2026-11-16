@@ -60,6 +60,12 @@ var MSPCodes = {
     MSP_OSD_CHAR_WRITE:         87,
     MSP_VTX_CONFIG:             88,
     MSP_SET_VTX_CONFIG:         89,
+
+    // VTX table rows, in Betaflight's message format (fork firmware with vtxtable support)
+    MSP_VTXTABLE_BAND:          137,
+    MSP_VTXTABLE_POWERLEVEL:    138,
+    MSP_SET_VTXTABLE_BAND:      227,
+    MSP_SET_VTXTABLE_POWERLEVEL: 228,
     MSP_ADVANCED_CONFIG:        90,
     MSP_SET_ADVANCED_CONFIG:    91,
     MSP_FILTER_CONFIG:          92,
@@ -282,7 +288,12 @@ var MSPCodes = {
     MSP2_SET_MZTC_SHUTTER:              0x2246,
     MSP2_SET_MZTC_IMAGE_PARAMS:         0x2247,
     MSP2_SET_MZTC_CORRECTION:           0x2248,
-    MSP2_SET_MZTC_VIGNETTING:           0x2249
+    MSP2_SET_MZTC_VIGNETTING:           0x2249,
+
+    // Fork-local commands (not in upstream INAV), from 0x2F00 to stay clear of upstream's IDs.
+    // Sizes of the stored VTX table; the rows use the MSP_VTXTABLE_* messages above.
+    MSP2_INAV_VTXTABLE_CONFIG:          0x2F00,
+    MSP2_INAV_SET_VTXTABLE_CONFIG:      0x2F01
 
 };
 

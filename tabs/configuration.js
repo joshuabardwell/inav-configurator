@@ -11,6 +11,8 @@ import VTX from './../js/vtx';
 import i18n from './../js/localization';
 import Settings from './../js/settings';
 import features from './../js/feature_framework';
+import vtxTableEditor from './../js/vtxTableEditor';
+import vtxTableMsp from './../js/vtxTableMsp';
 
 const configurationTab = {};
 
@@ -79,6 +81,7 @@ configurationTab.initialize = function (callback, scrollPosition) {
         mspHelper.loadSensorAlignment,
         mspHelper.loadAdvancedConfig,
         mspHelper.loadVTXConfig,
+        vtxTableMsp.load,
         mspHelper.loadBoardAlignment,
         mspHelper.loadCurrentMeterConfig,
         mspHelper.loadMiscV2,
@@ -94,6 +97,7 @@ configurationTab.initialize = function (callback, scrollPosition) {
     var saveChain = [
         mspHelper.saveAccTrim,
         mspHelper.saveAdvancedConfig,
+        vtxTableMsp.save,
         mspHelper.saveVTXConfig,
         mspHelper.saveCurrentMeterConfig,
         mspHelper.saveMiscV2,
@@ -248,6 +252,9 @@ configurationTab.initialize = function (callback, scrollPosition) {
             config_vtx.hide();
         }
 
+        // VTX table (fork firmware): shows the editor and rebuilds the menus above from the table
+        vtxTableEditor.init();
+
         // for some odd reason chrome 38+ changes scroll according to the touched select element
         // i am guessing this is a bug, since this wasn't happening on 37
         // code below is a temporary fix, which we will be able to remove in the future (hopefully)
@@ -325,6 +332,11 @@ configurationTab.initialize = function (callback, scrollPosition) {
         });
 
         $('a.save').on('click', function () {
+            // An invalid VTX table stops the save; the editor shows what is wrong
+            if (!vtxTableEditor.validate()) {
+                return;
+            }
+
             //UPDATE: moved to GPS tab and hidden
             //FC.MISC.mag_declination = parseFloat($('#mag_declination').val());
 

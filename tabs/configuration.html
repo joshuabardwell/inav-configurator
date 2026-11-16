@@ -478,6 +478,28 @@
         </div>
 
         <div class="clear-both"></div>
+
+        <!-- VTX table editor (fork firmware with vtxtable support); hidden on other firmware -->
+        <div class="config-section gui_box grey config-vtxtable" style="display: none">
+            <div class="gui_box_titlebar">
+                <div class="spacer_box_title" data-i18n="vtxTableTitle"></div>
+            </div>
+            <div class="spacer_box">
+                <div class="info-box" data-i18n="vtxTableHelp"></div>
+                <p id="vtxtable_summary"></p>
+                <div class="vtxtable-actions">
+                    <div class="default_btn narrow"><a href="#" id="vtxtable_load_file" data-i18n="vtxTableLoadFile"></a></div>
+                    <div class="default_btn narrow"><a href="#" id="vtxtable_save_file" data-i18n="vtxTableSaveFile"></a></div>
+                    <div class="default_btn narrow"><a href="#" id="vtxtable_copy_cli" data-i18n="vtxTableCopyCli"></a></div>
+                    <div class="default_btn narrow"><a href="#" id="vtxtable_builtin" data-i18n="vtxTableBuiltin"></a></div>
+                    <div class="default_btn narrow"><a href="#" id="vtxtable_clear" data-i18n="vtxTableClear"></a></div>
+                </div>
+                <div class="warning-box" id="vtxtable_error" style="display: none"></div>
+                <div id="vtxtable_editor"></div>
+            </div>
+        </div>
+
+        <div class="clear-both"></div>
     </div>
 
     <div class="content_toolbar">

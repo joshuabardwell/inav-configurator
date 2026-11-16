@@ -1587,6 +1587,96 @@
     "configurationVTXLowPowerDisarmValue_2": {
         "message": "Until first arm"
     },
+    "vtxTableTitle": {
+        "message": "VTX Table"
+    },
+    "vtxTableHelp": {
+        "message": "Define your own VTX bands, channel frequencies and power levels. The format is the same as Betaflight's vtxtable, so a Betaflight VTX table file for your VTX can be loaded here. A FACTORY band is selected on the VTX by band and channel number; a custom band is set by frequency. Power values are what gets sent to the VTX: milliwatts for IRC Tramp, dBm for SmartAudio 2.1, the level number (0, 1, 2...) for SmartAudio 2.0. With no table stored, the firmware uses its built-in bands and the VTX's own power levels. Changes are written with Save and Reboot."
+    },
+    "vtxTableLoadFile": {
+        "message": "Load from file"
+    },
+    "vtxTableSaveFile": {
+        "message": "Save to file"
+    },
+    "vtxTableCopyCli": {
+        "message": "Copy as CLI commands"
+    },
+    "vtxTableBuiltin": {
+        "message": "Start from built-in bands"
+    },
+    "vtxTableClear": {
+        "message": "Clear table"
+    },
+    "vtxTableBands": {
+        "message": "Bands"
+    },
+    "vtxTableChannels": {
+        "message": "Channels per band"
+    },
+    "vtxTablePowerLevels": {
+        "message": "Power levels"
+    },
+    "vtxTableBandName": {
+        "message": "Name"
+    },
+    "vtxTableBandLetter": {
+        "message": "Letter"
+    },
+    "vtxTableBandFactory": {
+        "message": "Factory"
+    },
+    "vtxTableBandFactoryHelp": {
+        "message": "Ticked: the VTX has this band built in and is told the band and channel number. Unticked: the VTX is told the frequency."
+    },
+    "vtxTableChannelHeader": {
+        "message": "Ch {channel} (MHz)"
+    },
+    "vtxTableChannelUnused": {
+        "message": "not used"
+    },
+    "vtxTablePowerLevel": {
+        "message": "Power level"
+    },
+    "vtxTablePowerValue": {
+        "message": "Value"
+    },
+    "vtxTablePowerValueHelp": {
+        "message": "The number sent to the VTX for this level: milliwatts for IRC Tramp, dBm for SmartAudio 2.1, the level number starting at 0 for SmartAudio 2.0."
+    },
+    "vtxTablePowerLabel": {
+        "message": "Label"
+    },
+    "vtxTableSummaryBands": {
+        "message": "Table bands: {bands} bands of {channels} channels."
+    },
+    "vtxTableSummaryNoBands": {
+        "message": "No bands in the table: the firmware's built-in bands are used."
+    },
+    "vtxTableSummaryPower": {
+        "message": "Table power levels: {levels}."
+    },
+    "vtxTableSummaryNoPower": {
+        "message": "No power levels in the table: the VTX's own power levels are used."
+    },
+    "vtxTableSummaryUnsaved": {
+        "message": "Not written to the flight controller yet: use Save and Reboot."
+    },
+    "vtxTableLoaded": {
+        "message": "VTX table loaded from file. Use Save and Reboot to write it to the flight controller."
+    },
+    "vtxTableLoadFailed": {
+        "message": "The VTX table file could not be used: {reason}"
+    },
+    "vtxTableInvalid": {
+        "message": "The VTX table was not saved: {reason}"
+    },
+    "vtxTableCopied": {
+        "message": "VTX table copied to the clipboard as CLI commands"
+    },
+    "vtxTableCopyFailed": {
+        "message": "Could not copy to the clipboard"
+    },
     "configurationGimbal": {
         "message": "Serial Gimbal"
     },

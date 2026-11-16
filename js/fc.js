@@ -453,6 +453,30 @@ var FC = {
             power_min: 1,
         };
 
+        // User-defined VTX bands and power levels (fork firmware). `supported` stays false on
+        // firmware without vtxtable support, and the VTX table editor is then hidden.
+        // `table` has the shape of a Betaflight vtxtable file's "vtx_table" (see js/vtxTable.js).
+        // The literals below repeat VTX_TABLE_DEFAULT_LIMITS and emptyVtxTable() from that
+        // module: this file is loaded on its own by tests that stub each import by name, so
+        // it must not gain an import. js/vtxTableMsp.js replaces both when it loads the table.
+        this.VTXTABLE = {
+            supported: false,
+            bands: 0,
+            channels: 0,
+            power_levels: 0,
+            limits: {
+                max_bands: 8,
+                max_channels: 8,
+                max_power_levels: 8,
+                band_name_length: 8,
+                power_label_length: 3,
+                max_frequency: 9999,
+            },
+            table: { bands_list: [], powerlevels_list: [] },
+            dirty: false,           // edited here and not yet written to the flight controller
+            write_refused: false,   // the flight controller rejected part of the last write
+        };
+
         this.ADVANCED_CONFIG = {
             gyroSyncDenominator: null,
             pidProcessDenom: null,

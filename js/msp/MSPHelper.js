@@ -1285,6 +1285,16 @@ var mspHelper = (function () {
                 console.log("VTX config saved");
                 break;
 
+            // VTX table (fork firmware). The replies are decoded by js/vtxTableMsp.js, in the
+            // callback of the request that asked for them, so nothing is done here.
+            case MSPCodes.MSP2_INAV_VTXTABLE_CONFIG:
+            case MSPCodes.MSP_VTXTABLE_BAND:
+            case MSPCodes.MSP_VTXTABLE_POWERLEVEL:
+            case MSPCodes.MSP2_INAV_SET_VTXTABLE_CONFIG:
+            case MSPCodes.MSP_SET_VTXTABLE_BAND:
+            case MSPCodes.MSP_SET_VTXTABLE_POWERLEVEL:
+                break;
+
             case MSPCodes.MSP_SET_ADVANCED_CONFIG:
                 console.log("Advanced config saved");
                 break;
