@@ -8,6 +8,7 @@ import GUI from './../js/gui';
 import FC from './../js/fc';
 import interval from './../js/intervals';
 import VTX from './../js/vtx';
+import { pickEditable, restoreEditable, readyMessageKey } from './../js/vtxReady';
 import i18n from './../js/localization';
 import Settings from './../js/settings';
 import features from './../js/feature_framework';
@@ -63,6 +64,31 @@ function bindMztcPresetSelector() {
         }
         applyMztcPreset(value);
     });
+}
+
+// VTX "Device ready": MSP_VTX_CONFIG is requested again every second for its ready flag. Each
+// reply also overwrites the saved band, channel, power and low-power-disarm in FC.VTX_CONFIG,
+// so the menu choices not yet saved are kept in vtxEdits and put back after the reply.
+function startVtxReadyRefresh() {
+    const showReady = function () {
+        $('#vtx_device_ready').val(i18n.getMessage(readyMessageKey(FC.VTX_CONFIG)));
+    };
+    let vtxEdits = pickEditable(FC.VTX_CONFIG);
+
+    // Bound on the tab, so it runs after the menus' own change handlers have updated FC.VTX_CONFIG.
+    // This also catches a choice made while a request is on its way.
+    $('.tab-configuration').on('change', function () {
+        vtxEdits = pickEditable(FC.VTX_CONFIG);
+    });
+
+    showReady();
+    interval.add('vtx_ready_pull', function () {
+        vtxEdits = pickEditable(FC.VTX_CONFIG);
+        MSP.send_message(MSPCodes.MSP_VTX_CONFIG, false, false, function () {
+            restoreEditable(FC.VTX_CONFIG, vtxEdits);
+            showReady();
+        });
+    }, 1000);
 }
 
 configurationTab.initialize = function (callback, scrollPosition) {
@@ -244,6 +270,7 @@ configurationTab.initialize = function (callback, scrollPosition) {
             });
 
             config_vtx.show();
+            startVtxReadyRefresh();
         } else {
             config_vtx.hide();
         }
@@ -325,6 +352,8 @@ configurationTab.initialize = function (callback, scrollPosition) {
         });
 
         $('a.save').on('click', function () {
+            interval.remove('vtx_ready_pull');
+
             //UPDATE: moved to GPS tab and hidden
             //FC.MISC.mag_declination = parseFloat($('#mag_declination').val());
 

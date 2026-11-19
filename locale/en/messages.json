@@ -1557,6 +1557,18 @@
     "configurationVTXBand": {
         "message": "Band"
     },
+    "configurationVTXDeviceReady": {
+        "message": "Device ready"
+    },
+    "configurationVTXDeviceReadyHelp": {
+        "message": "Whether the flight controller is hearing from the VTX right now. Updates every second. 'No' means band, channel and power changes are not reaching the VTX: check the VTX has power and the control wire is connected."
+    },
+    "configurationVTXDeviceReadyYes": {
+        "message": "Yes"
+    },
+    "configurationVTXDeviceReadyNo": {
+        "message": "No"
+    },
     "configurationNoBand": {
         "message": "None"
     },

@@ -1239,8 +1239,7 @@ var mspHelper = (function () {
                     FC.VTX_CONFIG.channel = data.getUint8(offset++);
                     FC.VTX_CONFIG.power = data.getUint8(offset++);
                     FC.VTX_CONFIG.pitmode = data.getUint8(offset++);
-                    // Ignore whether the VTX is ready for now
-                    offset++;
+                    FC.VTX_CONFIG.device_ready = data.getUint8(offset++);
                     FC.VTX_CONFIG.low_power_disarm = data.getUint8(offset++);
 
                     // Check if firmware supports VTX table (INAV 9.0+)

@@ -446,6 +446,7 @@ var FC = {
             channel: 1,
             power: 0,
             pitmode: 0,
+            device_ready: 0,
             low_power_disarm: 0,
             band_count: 0,
             channel_count: 0,
