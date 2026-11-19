@@ -2047,7 +2047,8 @@ OSD.constants = {
                 {
                     name: 'VTX_POWER',
                     id: 105,
-                    preview: FONT.symbol(SYM.VTX_POWER) + '1'
+                    // With a vtxtable the firmware shows the 3-character power label
+                    preview: FONT.symbol(SYM.VTX_POWER) + '200'
                 },
             ]
         },
