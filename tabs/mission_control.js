@@ -2920,23 +2920,23 @@ function iconKey(filename) {
         } else if (status.armed) {
             problems.push(i18n.getMessage('missionTerrainFcArmed'));
         } else {
-            const wanted = new Map();   // waypoint label -> { lat, lon, plannerM }
+            // One entry per waypoint at either end of a terrain leg. (A plain list: in this
+            // file `Map` is the OpenLayers map class, not the built-in collection.)
+            const wanted = [];      // { label, lat, lon, plannerM }
             terrainLegs.forEach(leg => {
                 [leg.index - 1, leg.index].forEach(i => {
                     const point = analysis.route[i];
                     const sample = i === 0 ? 0 : analysis.sampling.legs[i].lastSample;
-                    if (!wanted.has(point.label)) {
-                        wanted.set(point.label, {lat: point.lat, lon: point.lon, plannerM: analysis.terrainM[sample]});
+                    if (!wanted.some(entry => entry.label === point.label)) {
+                        wanted.push({label: point.label, lat: point.lat, lon: point.lon, plannerM: analysis.terrainM[sample]});
                     }
                 });
             });
-            const labels = [...wanted.keys()];
-            const result = await queryTerrainHeights(labels.map(label => wanted.get(label)));
+            const result = await queryTerrainHeights(wanted);
             const missing = [];
             const differing = [];
-            labels.forEach((label, n) => {
+            wanted.forEach(({label, plannerM}, n) => {
                 const onCard = result ? result.heights[n] : null;
-                const plannerM = wanted.get(label).plannerM;
                 if (onCard === null) {
                     missing.push(label);
                 } else if (plannerM !== null && Math.abs(onCard - plannerM) > 5) {
