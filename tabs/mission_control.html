@@ -236,6 +236,19 @@
                             <input id="MPapplySlrValue" type="checkbox" value="0" class="togglemedium">
                             <span id="MPapplySlrSaved" class="mpApplySaved" style="display: none">&#10003;</span>
                         </div>
+                        <div class="point">
+                            <label class="point-label" for="MPdefaultMinAgl" data-i18n="missionDefaultMinAgl"></label>
+                            <input id="MPdefaultMinAgl" type="text" value="60" required>
+                            <span class="input-unit">m</span>
+                            <div id="MPdefaultMinAglSource" class="mpTerrainFolderPath"></div>
+                        </div>
+                        <div class="point" id="MPterrainFolderRow" style="display: none">
+                            <label class="point-label" data-i18n="missionTerrainFolder"></label>
+                            <a id="MPterrainFolderChoose" class="mpTerrainFolderButton" href="#" data-i18n="missionTerrainFolderChoose"></a>
+                            <a id="MPterrainFolderClear" class="mpTerrainFolderButton" href="#" data-i18n="missionTerrainFolderClear"></a>
+                            <div id="MPterrainFolderPath" class="mpTerrainFolderPath"></div>
+                            <div id="MPterrainFolderStatus" class="mpTerrainFolderStatus"></div>
+                        </div>
                     </div>
                 </div>
 
@@ -587,10 +600,29 @@
                         <div class="point" id="elevationAtWP" style="display: none">
                             <label class="point-label" data-i18n="missionElevation"></label>
                             <span id="elevationValueAtWP" data-i18n="missionNA"></span>
+                            <span id="elevationSourceAtWP" class="elevationSource"></span>
                         </div>
                         <div class="point" id="groundClearanceAtWP" style="display: none">
                             <label class="point-label" for="groundClearanceValueAtWP" data-i18n="missionGroundDist">Grd Dist (m):</label>
                             <input id="groundClearanceValueAtWP" type="text" value="">
+                        </div>
+                        <div class="point" id="pointMinAglClass" style="display: none">
+                            <label class="point-label" for="pointMinAgl" data-i18n="missionMinAgl"></label>
+                            <input id="pointMinAgl" type="text" value="">
+                            <span id="pointMinAglDefault" class="elevationSource" data-i18n="missionMinAglDefault"></span>
+                            <a id="pointMinAglReset" class="mpTerrainFolderButton" href="#" data-i18n="missionMinAglReset" style="display: none"></a>
+                        </div>
+                        <div class="point" id="pointTerrainModeClass" style="display: none">
+                            <label class="point-label" for="pointTerrainMode" data-i18n="missionTerrainMode"></label>
+                            <select id="pointTerrainMode">
+                                <option value="0" data-i18n="missionTerrainModeOff"></option>
+                                <option value="1" data-i18n="missionTerrainModeFloor"></option>
+                                <option value="2" data-i18n="missionTerrainModeFollow"></option>
+                            </select>
+                            <div id="pointTerrainHint" class="mpTerrainFolderStatus"></div>
+                        </div>
+                        <div class="point" id="pointLegClearanceClass" style="display: none">
+                            <span id="pointLegClearance"></span>
                         </div>
                         <div class="point" id="pointP1class" style="display: none">
                             <label class="point-label" for="pointP1" data-i18n="missionParameter1"></label>

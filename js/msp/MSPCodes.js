@@ -293,7 +293,8 @@ var MSPCodes = {
     // Fork-local commands (not in upstream INAV), from 0x2F00 to stay clear of upstream's IDs.
     // Sizes of the stored VTX table; the rows use the MSP_VTXTABLE_* messages above.
     MSP2_INAV_VTXTABLE_CONFIG:          0x2F00,
-    MSP2_INAV_SET_VTXTABLE_CONFIG:      0x2F01
+    MSP2_INAV_SET_VTXTABLE_CONFIG:      0x2F01,
+    MSP2_INAV_TERRAIN_HEIGHT:           0x2F02  // terrain height from the SD card map, see js/terrain_msp_codec.js
 
 };
 

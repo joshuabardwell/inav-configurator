@@ -5730,6 +5730,150 @@
     "missionGroundDist": {
         "message": "Grd Dist (m):"
     },
+    "missionTerrainFolder": {
+        "message": "Terrain folder: "
+    },
+    "missionTerrainFolderChoose": {
+        "message": "Choose..."
+    },
+    "missionTerrainFolderClear": {
+        "message": "Use online data"
+    },
+    "missionTerrainFolderNone": {
+        "message": "None chosen. Elevations come from the online source."
+    },
+    "missionTerrainFolderNotFound": {
+        "message": "This folder cannot be opened. Elevations come from the online source."
+    },
+    "missionTerrainFolderMissingTiles": {
+        "message": "No terrain file in the folder for: $1. The online source is used there."
+    },
+    "missionTerrainFolderDialogTitle": {
+        "message": "Select the folder that holds the .TER terrain files"
+    },
+    "missionDefaultMinAgl": {
+        "message": "Min AGL: "
+    },
+    "missionDefaultMinAglFromFc": {
+        "message": "Default for every waypoint: terrain_nav_min_agl on the flight controller."
+    },
+    "missionDefaultMinAglStored": {
+        "message": "Default for every waypoint. Stored in the planner; no flight controller setting was read."
+    },
+    "missionDefaultMinAglRange": {
+        "message": "The minimum height above ground must be between $1 and $2 m."
+    },
+    "missionDefaultMinAglSaved": {
+        "message": "terrain_nav_min_agl set to $1 m on the flight controller."
+    },
+    "missionDefaultMinAglSaveFailed": {
+        "message": "terrain_nav_min_agl could not be written to the flight controller. The planner keeps $1 m for itself."
+    },
+    "missionMinAgl": {
+        "message": "Min AGL (m):"
+    },
+    "missionMinAglDefault": {
+        "message": "default"
+    },
+    "missionMinAglReset": {
+        "message": "Use default"
+    },
+    "missionTerrainMode": {
+        "message": "Terrain:"
+    },
+    "missionTerrainModeOff": {
+        "message": "Off"
+    },
+    "missionTerrainModeFloor": {
+        "message": "Floor: climb to keep the minimum"
+    },
+    "missionTerrainModeFollow": {
+        "message": "Follow: hold the ground distance"
+    },
+    "missionTerrainFollowNeedsTerrain": {
+        "message": "Follow needs the ground height at this waypoint from a terrain file. Choose the terrain folder in the settings box."
+    },
+    "missionTerrainFollowNeedsHome": {
+        "message": "Follow needs a home position for a waypoint whose altitude is relative to home, or switch the waypoint to Sea level Ref."
+    },
+    "missionTerrainHintFollow": {
+        "message": "Type the height to hold in Grd Dist. The altitude is worked out from the terrain file."
+    },
+    "missionTerrainHintFollowRelative": {
+        "message": "This altitude is relative to home. If you take off somewhere else the held height changes. Sea level Ref avoids that."
+    },
+    "missionTerrainHintStock": {
+        "message": "Needs this fork's firmware with terrain_enabled ON. Stock firmware flies the straight line."
+    },
+    "missionLegClearance": {
+        "message": "Leg to this point: lowest ground distance $1 m, $2 m before it."
+    },
+    "missionLegClearanceUnknown": {
+        "message": "Leg to this point: ground distance not known (no terrain data, or an altitude relative to home without a home position)."
+    },
+    "missionTerrainChartTerrain": {
+        "message": "Terrain"
+    },
+    "missionTerrainChartMinimum": {
+        "message": "Terrain + minimum"
+    },
+    "missionTerrainChartWaypoints": {
+        "message": "Waypoint altitude"
+    },
+    "missionTerrainChartPredicted": {
+        "message": "Predicted altitude"
+    },
+    "missionTerrainChartFollow": {
+        "message": "Following terrain"
+    },
+    "missionTerrainChartClimb": {
+        "message": "Climb forced by terrain"
+    },
+    "missionTerrainChartBelow": {
+        "message": "Below minimum"
+    },
+    "missionTerrainChartStock": {
+        "message": "Without terrain data"
+    },
+    "missionTerrainChartSourceTer": {
+        "message": "terrain files"
+    },
+    "missionTerrainChartSourceOnline": {
+        "message": "online data"
+    },
+    "missionTerrainChartSourceMixed": {
+        "message": "terrain files and online data"
+    },
+    "missionTerrainChartSourceCoarse": {
+        "message": "online data, coarse: legs are not checked every 30 m"
+    },
+    "missionTerrainFcStock": {
+        "message": "This flight controller's firmware has no terrain options for missions. The Floor and Follow legs of this mission will fly as plain legs, straight to the stored altitudes."
+    },
+    "missionTerrainFcDisabled": {
+        "message": "terrain_enabled is OFF on the flight controller. The Floor and Follow legs of this mission will fly as plain legs until it is switched ON."
+    },
+    "missionTerrainFcCardFailure": {
+        "message": "The flight controller reports an SD card failure, so it has no terrain data. The Floor and Follow legs of this mission will fly as plain legs."
+    },
+    "missionTerrainFcArmed": {
+        "message": "The terrain on the flight controller's SD card cannot be checked while it is armed."
+    },
+    "missionTerrainFcMissing": {
+        "message": "The flight controller's SD card has no terrain data at waypoint(s) $1. Legs there fly as plain legs."
+    },
+    "missionTerrainFcDiffers": {
+        "message": "The terrain on the flight controller's SD card differs by more than 5 m from the planner's terrain folder at waypoint(s) $1. The planner's picture of those legs does not match what the aircraft will do."
+    },
+    "missionTerrainFcOk": {
+        "message": "Terrain on the flight controller's SD card matches the planner at $1 waypoint(s) of the Floor and Follow legs."
+    },
+    "missionElevationSourceTer": {
+        "message": "terrain file"
+    },
+    "missionElevationSourceOnline": {
+        "message": "online"
+    },
     "missionParameter1": {
         "message": "Parameter 1:"
     },

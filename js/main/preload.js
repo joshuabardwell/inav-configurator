@@ -73,6 +73,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   writeFile: (filename, data) => ipcRenderer.invoke('writeFile', filename, data),
   appendFile: (filename, data) => ipcRenderer.invoke('appendFile', filename, data),
   readFile: (filename, encoding = 'utf8') => ipcRenderer.invoke('readFile', filename, encoding),
+  readFileRanges: (filename, ranges) => ipcRenderer.invoke('readFileRanges', filename, ranges),
   rm: (path) => ipcRenderer.invoke('rm', path),
   pathExists: (path) => ipcRenderer.invoke('pathExists', path),
   ejectDrive: (driveLetter) => ipcRenderer.invoke('ejectDrive', driveLetter),

@@ -1,6 +1,6 @@
 'use strict';
 
-import elevationFetch from './elevationFetch';
+import { getElevation as lookUpElevation } from './elevationProvider.js';
 
 let Waypoint = function (number, action, lat, lon, alt=0, p1=0, p2=0, p3=0, endMission=0, isUsed=true, isAttached=false, attachedId="", multiMissionIdx = 0) {
 
@@ -8,6 +8,7 @@ let Waypoint = function (number, action, lat, lon, alt=0, p1=0, p2=0, p3=0, endM
     let layerNumber = "undefined";
     let attachedNumber = "undefined";
     let poiNumber = "undefined";
+    let elevationSource = "none";
 
     self.getNumber = function () {
         return number;
@@ -145,18 +146,26 @@ let Waypoint = function (number, action, lat, lon, alt=0, p1=0, p2=0, p3=0, endM
         return multiMissionIdx;
     }
 
+    // Ground elevation in metres, or "N/A". Comes from the terrain folder when one is
+    // chosen and has the tile, otherwise from the online lookup (js/elevationProvider.js).
     self.getElevation = async function (globalSettings) {
         let elevation = "N/A";
+        elevationSource = "none";
         try {
-            const response = await elevationFetch('https://api.opentopodata.org/v1/aster30m?locations='+self.getLatMap()+','+self.getLonMap());
-            const myJson = await response.json();
-            if (myJson.status == "OK" && myJson.results[0].elevation != null) {
-                elevation = myJson.results[0].elevation;
+            const result = await lookUpElevation(self.getLatMap(), self.getLonMap());
+            elevationSource = result.source;
+            if (result.elevation != null) {
+                elevation = result.elevation;
             }
         } catch (error) {
             console.log('Elevation lookup failed: ' + error.message);
         }
         return elevation;
+    }
+
+    // Where the last getElevation() answer came from: "ter", "online" or "none".
+    self.getElevationSource = function () {
+        return elevationSource;
     }
 
     return self;
