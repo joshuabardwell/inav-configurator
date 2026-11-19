@@ -390,6 +390,33 @@
     "mapgenClearCache": {
         "message": "Clear Cache"
     },
+    "mapgenOfflineData": {
+        "message": "Offline Data"
+    },
+    "mapgenOfflineHint": {
+        "message": "Download elevation data and map imagery ahead of time, so .TER files can be made without internet."
+    },
+    "mapgenOfflineChangeFolder": {
+        "message": "Change Folder"
+    },
+    "mapgenOfflineRegion": {
+        "message": "Region"
+    },
+    "mapgenOfflineZoom": {
+        "message": "Imagery to zoom"
+    },
+    "mapgenOfflineSatellite": {
+        "message": "Esri satellite"
+    },
+    "mapgenOfflineStreet": {
+        "message": "Esri street map"
+    },
+    "mapgenOfflineLabels": {
+        "message": "Esri road labels"
+    },
+    "mapgenOfflineDownload": {
+        "message": "Download for Offline Use"
+    },
     "sitlDemoMode": {
         "message": "Demo Mode"
     },

@@ -12,11 +12,18 @@ import i18n from './../js/localization';
 import store from './../js/store';
 import { globalSettings, UnitType } from './../js/globalSettings';
 import JSZip from 'jszip';
-import { fromUrl, fromArrayBuffer } from 'geotiff';
+import { terrainDatFilename } from './../js/terrain_ter.js';
 import {
-    TERRAIN_SPACING, TERRAIN_BLK_SPACE_X, TERRAIN_IO_BLOCK,
-    addOffset, eastBlocks, buildTerBlock, terrainPackerSelfTest, terrainDatFilename
-} from './../js/terrain_ter.js';
+    srtmTileName, estimateDatSizeMB, createDatFromHgt, ensureSrtmCellData,
+    COPERNICUS_NOTICE_1, COPERNICUS_NOTICE_2, TERRAIN_ATTR_SRTM, TERRAIN_ATTR_COPERNICUS,
+    copernicusNoticeText, COPERNICUS_CACHE_PREFIX, HGT_GRID_BYTES, ensureCopernicusCellData,
+    MissingElevationError,
+} from './../js/terrain_elevation.js';
+import {
+    cellsForBounds, cellsForRange, withNeighbours, cellKey, hasCellFile, cellFileBytes, elevationFile, elevationFileName,
+    REGIONS, regionById, BOX_IMAGERY_ZOOM, IMAGERY_LAYERS, imageryLocalPath, tilesInRanges,
+    planDownload, formatBytes, formatDuration, CELL_INDEX_INFO,
+} from './../js/offline_regions.js';
 
 // Fix Leaflet default marker icon paths (broken by bundlers)
 delete L.Icon.Default.prototype._getIconUrl;
@@ -357,451 +364,6 @@ const tileCache = {
     },
 };
 
-// ─── Elevation grid → .TER conversion engine ──────────────────────────────────
-const SRTM_BASE_URL = 'https://s3.amazonaws.com/elevation-tiles-prod/skadi';
-const SRTM_GRID = 3601;
-function makeHgtView(hgtData) {
-    const hgtBuf = (hgtData.buffer && hgtData.buffer.byteLength === hgtData.length)
-        ? hgtData.buffer : hgtData.buffer.slice(hgtData.byteOffset, hgtData.byteOffset + hgtData.byteLength);
-    return new DataView(hgtBuf);
-}
-
-function hgtElevation(hgtCache, degLat, degLon, lat, lon) {
-    let tileLat = Math.floor(lat);
-    let tileLon = Math.floor(lon);
-    let key = tileLat + '_' + tileLon;
-    let hgtView = hgtCache[key];
-    if (!hgtView) {
-        key = degLat + '_' + degLon;
-        hgtView = hgtCache[key];
-        if (!hgtView) return 0;
-        tileLat = degLat;
-        tileLon = degLon;
-    }
-    const fracLat = Math.max(0, Math.min(1, lat - tileLat));
-    const fracLon = Math.max(0, Math.min(1, lon - tileLon));
-    const rowF = (1 - fracLat) * 3600;
-    const colF = fracLon * 3600;
-    const r0 = Math.max(0, Math.min(3599, Math.floor(rowF)));
-    const c0 = Math.max(0, Math.min(3599, Math.floor(colF)));
-    const r1 = Math.min(3600, r0 + 1);
-    const c1 = Math.min(3600, c0 + 1);
-    const dr = Math.max(0, Math.min(1, rowF - r0));
-    const dc = Math.max(0, Math.min(1, colF - c0));
-    function getH(r, c) {
-        const v = hgtView.getInt16((r * SRTM_GRID + c) * 2, false);
-        return v === -32768 ? 0 : v;
-    }
-    const alt = Math.trunc(
-        getH(r0, c0) * (1 - dr) * (1 - dc) +
-        getH(r0, c1) * (1 - dr) * dc +
-        getH(r1, c0) * dr * (1 - dc) +
-        getH(r1, c1) * dr * dc
-    );
-    return alt < 0 ? 0 : alt;
-}
-
-function srtmTileName(lat, lon) {
-    const lp = lat >= 0 ? 'N' : 'S';
-    const lnp = lon >= 0 ? 'E' : 'W';
-    return lp + String(Math.abs(lat)).padStart(2, '0') + lnp + String(Math.abs(lon)).padStart(3, '0');
-}
-
-function srtmUrl(lat, lon) {
-    const name = srtmTileName(lat, lon);
-    return SRTM_BASE_URL + '/' + name.substring(0, 3) + '/' + name + '.hgt.gz';
-}
-
-function estimateDatSizeMB(lat) {
-    const baseLat = Math.floor(Math.abs(lat)) * (lat >= 0 ? 1 : -1) * 10000000;
-    const baseLon = 0;
-    let numX = 0;
-    while (addOffset(baseLat, baseLon, numX * TERRAIN_BLK_SPACE_X * TERRAIN_SPACING, 0)[0] * 1e-7 - baseLat * 1e-7 < 1.0) numX++;
-    const numY = eastBlocks(baseLat, baseLon);
-    return (numX * numY * TERRAIN_IO_BLOCK) / 1048576;
-}
-
-async function createDatFromHgt(degLat, degLon, hgtCache, progressCb) {
-    terrainPackerSelfTest();
-    const baseLat = degLat * 10000000;
-    const baseLon = degLon * 10000000;
-    let numX = 0;
-    while (addOffset(baseLat, baseLon, numX * TERRAIN_BLK_SPACE_X * TERRAIN_SPACING, 0)[0] * 1e-7 - degLat < 1.0) numX++;
-    const numY = eastBlocks(baseLat, baseLon);
-    const totalBlocks = numX * numY;
-    const output = new Uint8Array(totalBlocks * TERRAIN_IO_BLOCK);
-    let blockNum = 0;
-    for (let ix = 0; ix < numX; ix++) {
-        for (let iy = 0; iy < numY; iy++) {
-            const block = buildTerBlock(degLat, degLon, ix, iy,
-                (lat, lon) => hgtElevation(hgtCache, degLat, degLon, lat, lon));
-            output.set(block, blockNum * TERRAIN_IO_BLOCK);
-            blockNum++;
-            if (blockNum % 200 === 0) {
-                if (progressCb) progressCb(blockNum, totalBlocks);
-                await new Promise(r => setTimeout(r, 0));
-            }
-        }
-    }
-    if (progressCb) progressCb(totalBlocks, totalBlocks);
-    return output;
-}
-
-async function decompressGz(arrayBuffer) {
-    const ds = new DecompressionStream('gzip');
-    const blob = new Blob([arrayBuffer]);
-    const decompressed = blob.stream().pipeThrough(ds);
-    const reader = decompressed.getReader();
-    const chunks = [];
-    while (true) {
-        const result = await reader.read();
-        if (result.done) break;
-        chunks.push(result.value);
-    }
-    const totalLen = chunks.reduce((s, c) => s + c.length, 0);
-    const data = new Uint8Array(totalLen);
-    let off = 0;
-    for (const chunk of chunks) { data.set(chunk, off); off += chunk.length; }
-    return data;
-}
-
-async function fetchSrtmTile(lat, lon, statusCb) {
-    const url = srtmUrl(lat, lon);
-    if (statusCb) statusCb('connecting');
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error('HTTP ' + resp.status);
-    if (statusCb) statusCb('downloading');
-    const gz = await resp.arrayBuffer();
-    if (statusCb) statusCb('decompressing');
-    return await decompressGz(gz);
-}
-
-// ─── Copernicus GLO-30 → HGT-shaped grid ───────────────────────────────
-// Copernicus tiles are 1°x1° Cloud-Optimized GeoTIFF (Float32, pixel-is-point,
-// always 3600 rows tall). Below 50° latitude they are also 3600 px wide and
-// their sample points fall on exactly the same whole arc-second graticule as
-// SRTM .hgt, so filling the 3601x3601 grid that hgtElevation()/
-// createDatFromHgt() expect is a direct copy. Towards the poles the tiles get
-// NARROWER (2400 px at 50–60°, 1800 at 60–70°, 1200 at 70–80°, 720 at 80–85°,
-// 360 at 85–90°, mirrored south of the equator), so there the grid columns map
-// onto the tile's real width via copernicusColPlan(). The 3601st row/column
-// (the tile's south and east edges) belong to the south / east neighbour
-// tiles and are copied from them.
-const COPERNICUS_BASE_URL = 'https://copernicus-dem-30m.s3.amazonaws.com';
-// Required verbatim by the Copernicus WorldDEM-30 licence (Art. 6). These must
-// be reproduced character-for-character wherever the derived .TER files are
-// presented or shipped, and imply no endorsement by any of the named parties.
-const COPERNICUS_NOTICE_1 = 'produced using Copernicus WorldDEM-30 © DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018 provided under COPERNICUS by the European Union and ESA; all rights reserved';
-const COPERNICUS_NOTICE_2 = 'The organisations in charge of the Copernicus programme by law or by delegation do not incur any liability for any use of the Copernicus WorldDEM-30';
-const TERRAIN_ATTR_SRTM = 'Elevation data: <a href="https://www.usgs.gov/centers/eros/science/usgs-eros-archive-digital-elevation-shuttle-radar-topography-mission-srtm-1">NASA SRTM</a>';
-const TERRAIN_ATTR_COPERNICUS = 'Elevation data: <a href="https://registry.opendata.aws/copernicus-dem/">Copernicus WorldDEM-30</a>';
-// Shipped inside the exported ZIP. The WorldDEM-30 licence (Art. 6) ties the
-// notices to distribution / communication to the public, so the ZIP — the
-// artefact a user can pass on — carries them, while a direct write to the
-// user's own flight controller SD card (personal use) does not.
-function copernicusNoticeText() {
-    return 'INAV Terrain elevation data — attribution notice\r\n\r\n' +
-        'Elevation source: Copernicus WorldDEM-30 (GLO-30), 30 m\r\n' +
-        'https://registry.opendata.aws/copernicus-dem/\r\n\r\n' +
-        COPERNICUS_NOTICE_1 + '\r\n\r\n' +
-        COPERNICUS_NOTICE_2 + '\r\n\r\n' +
-        'This product is not endorsed by or affiliated with the European Union, ESA,\r\n' +
-        'Airbus Defence and Space GmbH or DLR e.V.\r\n\r\n' +
-        'Elevation data is provided "as is", without any warranty.\r\n' +
-        'Always verify terrain clearance before flight.\r\n';
-}
-
-const COPERNICUS_GRID = 3600;
-const COPERNICUS_ROW_BAND = 600;      // rows decoded per step, to cap peak memory
-const COPERNICUS_MAX_RETRIES = 2;
-// Grids cached under the old 'cop_' prefix were built assuming every tile is
-// 3600 px wide and are wrong at |lat| >= 50° — never reuse them.
-const COPERNICUS_CACHE_PREFIX = 'cop2_';
-
-// Sampling plan for mapping 3600-grid columns [colFrom..colTo] onto a tile
-// that is `width` px wide: each grid column sits at source position
-// col*width/3600 and is interpolated linearly between the two neighbouring
-// sample columns. The weight is exactly 0 when width == 3600 (below 50°
-// latitude), where the plan degenerates to a direct column copy.
-function copernicusColPlan(colFrom, colTo, width) {
-    const n = colTo - colFrom + 1;
-    const left = new Int32Array(n);       // left sample column, relative to srcFrom
-    const right = new Int32Array(n);      // right sample column, relative to srcFrom
-    const weight = new Float64Array(n);   // share of the right sample
-    const srcFrom = Math.floor(colFrom * width / COPERNICUS_GRID);
-    let srcTo = srcFrom;
-    for (let k = 0; k < n; k++) {
-        const x = (colFrom + k) * width / COPERNICUS_GRID;
-        const a = Math.floor(x);
-        const b = Math.min(width - 1, a + 1);
-        left[k] = a - srcFrom;
-        right[k] = b - srcFrom;
-        weight[k] = x - a;
-        if (b > srcTo) srcTo = b;
-    }
-    return { srcFrom, srcTo, left, right, weight };
-}
-
-// Interpolates one value from a raster row slice using a copernicusColPlan
-// entry. The weight-0 shortcut keeps width-3600 output bit-exact. A
-// non-finite (void) sample must not bleed into its valid neighbour through
-// the interpolation, so it stays local: the nearer pixel wins, matching how
-// copernicusToInt16() treats a void on the direct-copy path.
-function copernicusSample(data, base, plan, k) {
-    const a = data[base + plan.left[k]];
-    const w = plan.weight[k];
-    if (w === 0) return a;
-    const b = data[base + plan.right[k]];
-    if (!Number.isFinite(a) || !Number.isFinite(b)) return w < 0.5 ? a : b;
-    return a + (b - a) * w;
-}
-
-function copernicusTileStem(lat, lon) {
-    const ns = (lat >= 0 ? 'N' : 'S') + String(Math.abs(lat)).padStart(2, '0');
-    const ew = (lon >= 0 ? 'E' : 'W') + String(Math.abs(lon)).padStart(3, '0');
-    return `Copernicus_DSM_COG_10_${ns}_00_${ew}_00_DEM`;
-}
-
-function copernicusUrl(lat, lon) {
-    const stem = copernicusTileStem(lat, lon);
-    return `${COPERNICUS_BASE_URL}/${stem}/${stem}.tif`;
-}
-
-// Polite retry: back off on transient errors (503 throttling), give up on 404
-// (a tile that simply does not exist — ocean or outside coverage).
-async function copernicusRetry(fn) {
-    let lastErr = null;
-    for (let attempt = 0; attempt <= COPERNICUS_MAX_RETRIES; attempt++) {
-        if (attempt > 0) await sleep(500 * (attempt + 1));
-        try {
-            return await fn();
-        } catch (e) {
-            if (e?.notFound) throw e;
-            lastErr = e;
-        }
-    }
-    throw lastErr || new Error('Copernicus request failed');
-}
-
-// Opens one Copernicus tile. `full` downloads the whole GeoTIFF in a single
-// request (used for the tile being generated); otherwise the file is read
-// remotely with HTTP range requests, so a thin neighbour strip only pulls the
-// blocks it touches. Returns null when the tile does not exist.
-async function openCopernicusImage(lat, lon, imgCache, full, statusCb) {
-    const key = lat + '_' + lon;
-    if (Object.hasOwn(imgCache, key) && (imgCache[key] === null || imgCache[key].full || !full)) {
-        return imgCache[key] ? imgCache[key].image : null;
-    }
-    try {
-        const entry = await copernicusRetry(async () => {
-            if (full) {
-                if (statusCb) statusCb('downloading');
-                const resp = await fetch(copernicusUrl(lat, lon));
-                if (resp.status === 404) {           // no file = square is entirely sea
-                    const err = new Error('HTTP 404');
-                    err.notFound = true;
-                    throw err;
-                }
-                if (!resp.ok) throw new Error('HTTP ' + resp.status);
-                const buf = await resp.arrayBuffer();
-                if (statusCb) statusCb('decoding', buf.byteLength);
-                const tiff = await fromArrayBuffer(buf);
-                return { image: await tiff.getImage(), full: true };
-            }
-            try {
-                const tiff = await fromUrl(copernicusUrl(lat, lon));
-                return { image: await tiff.getImage(), full: false };
-            } catch (e) {
-                // geotiff throws a generic error with no status. Confirm with a
-                // HEAD: this bucket returns 404 for 1° squares that are entirely
-                // sea (no file) — that is "no data", so the edge stays at sea
-                // level. A 403 or anything else is a real access/network problem
-                // and must surface (→ ask-first SRTM fallback), not be silently
-                // zeroed into the terrain.
-                const head = await fetch(copernicusUrl(lat, lon), { method: 'HEAD' });
-                if (head.status === 404) {
-                    const err = new Error('HTTP 404');
-                    err.notFound = true;
-                    throw err;
-                }
-                throw e;
-            }
-        });
-        imgCache[key] = entry;
-        return entry.image;
-    } catch (e) {
-        // Missing tile is "no data", not a failure — but a network/server
-        // problem must surface so the user can decide about the fallback.
-        if (!e?.notFound) throw e;
-        imgCache[key] = null;
-        return null;
-    }
-}
-
-function copernicusToInt16(v) {
-    if (!Number.isFinite(v)) return 0;              // void → sea level, as the SRTM path does
-    const r = Math.round(v);
-    if (r > 32767) return 32767;
-    if (r < -32767) return -32767;                  // keep -32768 reserved as the .hgt void marker
-    return r;
-}
-
-// East edge (grid column 3600) is the west column of the east neighbour.
-async function copernicusFillEastEdge(degLat, degLon, rowFrom, rowMainTo, imgCache, view) {
-    const east = await openCopernicusImage(degLat, degLon + 1, imgCache, false, null);
-    if (!east) return;
-    const [col] = await east.readRasters({ window: [0, rowFrom, 1, rowMainTo + 1] });
-    for (let r = rowFrom; r <= rowMainTo; r++) {
-        view.setInt16((r * SRTM_GRID + COPERNICUS_GRID) * 2, copernicusToInt16(col[r - rowFrom]), false);
-    }
-}
-
-// South edge (grid row 3600) is the north row of the south neighbour, which
-// can sit in a different width band (e.g. N49 under an N50 tile), so its
-// columns map through its OWN width. Also fills the SE corner when asked.
-async function copernicusFillSouthEdge(degLat, degLon, colFrom, colMainTo, withCorner, imgCache, view) {
-    const south = await openCopernicusImage(degLat - 1, degLon, imgCache, false, null);
-    if (south) {
-        const plan = copernicusColPlan(colFrom, colMainTo, south.getWidth());
-        const [row] = await south.readRasters({ window: [plan.srcFrom, 0, plan.srcTo + 1, 1] });
-        let off = (COPERNICUS_GRID * SRTM_GRID + colFrom) * 2;
-        for (let k = 0; k < plan.left.length; k++) {
-            view.setInt16(off, copernicusToInt16(copernicusSample(row, 0, plan, k)), false);
-            off += 2;
-        }
-    }
-    if (withCorner) {
-        const southEast = await openCopernicusImage(degLat - 1, degLon + 1, imgCache, false, null);
-        if (southEast) {
-            const [px] = await southEast.readRasters({ window: [0, 0, 1, 1] });
-            view.setInt16((COPERNICUS_GRID * SRTM_GRID + COPERNICUS_GRID) * 2, copernicusToInt16(px[0]), false);
-        }
-    }
-}
-
-// Fills rows [rowFrom..rowTo] x cols [colFrom..colTo] of a 3601x3601
-// big-endian int16 grid for the 1° cell (degLat, degLon). Returns null if the
-// cell's own Copernicus tile does not exist.
-async function buildCopernicusGrid(degLat, degLon, rowFrom, rowTo, colFrom, colTo, imgCache, opts) {
-    const options = opts || {};
-    const statusCb = options.statusCb;
-    const primary = await openCopernicusImage(degLat, degLon, imgCache, !!options.full, statusCb);
-    if (!primary) return null;
-    const primaryWidth = primary.getWidth();
-    if (primary.getHeight() !== COPERNICUS_GRID) {
-        throw new Error('Unexpected Copernicus tile height ' + primary.getHeight() +
-            ' for ' + copernicusTileStem(degLat, degLon));
-    }
-
-    const bytes = new Uint8Array(SRTM_GRID * SRTM_GRID * 2);
-    const view = new DataView(bytes.buffer);
-
-    const rowMainTo = Math.min(rowTo, COPERNICUS_GRID - 1);
-    const colMainTo = Math.min(colTo, COPERNICUS_GRID - 1);
-    const bandTotal = Math.max(1, rowMainTo - rowFrom + 1);
-
-    // Body: grid row r == tile pixel row r; grid columns sample the tile at
-    // their true positions via copernicusColPlan() — reading past the tile's
-    // real width would make geotiff.js silently zero-fill instead of failing.
-    const plan = copernicusColPlan(colFrom, colMainTo, primaryWidth);
-    const srcWidth = plan.srcTo - plan.srcFrom + 1;
-    for (let bandTop = rowFrom; bandTop <= rowMainTo; bandTop += COPERNICUS_ROW_BAND) {
-        const bandBottom = Math.min(rowMainTo, bandTop + COPERNICUS_ROW_BAND - 1);
-        const [band] = await primary.readRasters({
-            window: [plan.srcFrom, bandTop, plan.srcTo + 1, bandBottom + 1],
-        });
-        for (let r = bandTop; r <= bandBottom; r++) {
-            const src = (r - bandTop) * srcWidth;
-            let off = (r * SRTM_GRID + colFrom) * 2;
-            for (let k = 0; k < plan.left.length; k++) {
-                view.setInt16(off, copernicusToInt16(copernicusSample(band, src, plan, k)), false);
-                off += 2;
-            }
-        }
-        if (statusCb) statusCb('grid', bandBottom - rowFrom + 1, bandTotal);
-        await new Promise(r => setTimeout(r, 0));
-    }
-
-    if (colTo >= COPERNICUS_GRID) {
-        await copernicusFillEastEdge(degLat, degLon, rowFrom, rowMainTo, imgCache, view);
-    }
-    if (rowTo >= COPERNICUS_GRID) {
-        await copernicusFillSouthEdge(degLat, degLon, colFrom, colMainTo, colTo >= COPERNICUS_GRID, imgCache, view);
-    }
-
-    return view;
-}
-
-// The .TER block grid starts at the cell's south-west corner and walks north
-// and east, overshooting the 1° square (~370 m north, ~2 km east at 42°N), so
-// the north / east / north-east neighbours must supply the samples past the
-// edge. Only that thin margin is needed, not the whole neighbour tile.
-function copernicusNorthMarginRows() {
-    return Math.ceil((1200 / 111320) * COPERNICUS_GRID) + 2;
-}
-
-function copernicusEastMarginCols(degLat) {
-    const cos = Math.max(0.05, Math.cos((degLat + 0.5) * Math.PI / 180));
-    return Math.ceil((2500 / (111320 * cos)) * COPERNICUS_GRID) + 2;
-}
-
-// Returns the tile cache createDatFromHgt() needs for one 1° cell: a full grid
-// for the cell itself plus N/E/NE edge data. Partial strips live in a per-cell
-// object and are never written to runCache or IndexedDB — a strip sits in a
-// zero-filled full-size buffer, so reusing one as a complete grid would look
-// like an ocean tile.
-async function ensureCopernicusCellData(degLat, degLon, runCache, imgCache, statusCb) {
-    const primaryKey = degLat + '_' + degLon;
-    if (!runCache[primaryKey]) {
-        const cachedBuf = await hgtDb.get(COPERNICUS_CACHE_PREFIX + primaryKey);
-        if (cachedBuf) runCache[primaryKey] = makeHgtView(new Uint8Array(cachedBuf));
-    }
-
-    const cellCache = {};
-    if (runCache[primaryKey]) cellCache[primaryKey] = runCache[primaryKey];
-
-    if (!cellCache[primaryKey]) {
-        const grid = await buildCopernicusGrid(degLat, degLon, 0, COPERNICUS_GRID, 0, COPERNICUS_GRID,
-            imgCache, { full: true, statusCb });
-        if (!grid) return null;
-        runCache[primaryKey] = grid;
-        cellCache[primaryKey] = grid;
-        void hgtDb.put(COPERNICUS_CACHE_PREFIX + primaryKey, grid.buffer);   // fire-and-forget by design
-    }
-
-    const rowStart = COPERNICUS_GRID - copernicusNorthMarginRows();
-    const colEnd = Math.min(COPERNICUS_GRID, copernicusEastMarginCols(degLat));
-    const neighbors = [
-        { lat: degLat, lon: degLon + 1, rowFrom: 0, rowTo: COPERNICUS_GRID, colFrom: 0, colTo: colEnd },
-        { lat: degLat + 1, lon: degLon, rowFrom: rowStart, rowTo: COPERNICUS_GRID, colFrom: 0, colTo: COPERNICUS_GRID },
-        { lat: degLat + 1, lon: degLon + 1, rowFrom: rowStart, rowTo: COPERNICUS_GRID, colFrom: 0, colTo: colEnd },
-    ];
-    for (const nb of neighbors) {
-        const key = nb.lat + '_' + nb.lon;
-        if (runCache[key]) { cellCache[key] = runCache[key]; continue; }
-        if (statusCb) statusCb('edges');
-        const strip = await buildCopernicusGrid(nb.lat, nb.lon, nb.rowFrom, nb.rowTo, nb.colFrom, nb.colTo,
-            imgCache, { full: false });
-        if (strip) cellCache[key] = strip;   // per-cell only — never cached as a full grid
-    }
-
-    return cellCache;
-}
-
-function getTerrainDegreeTiles(bounds) {
-    const tiles = [];
-    const latMin = Math.floor(bounds.getSouth());
-    const latMax = Math.floor(bounds.getNorth());
-    const lonMin = Math.floor(bounds.getWest());
-    const lonMax = Math.floor(bounds.getEast());
-    for (let lat = latMin; lat <= latMax; lat++) {
-        for (let lon = lonMin; lon <= lonMax; lon++) {
-            tiles.push({ lat, lon });
-        }
-    }
-    return tiles;
-}
-
 // ─── IndexedDB HGT cache (persist downloaded SRTM tiles for resume/reuse) ──
 const hgtDb = {
     _instance: null,
@@ -884,6 +446,142 @@ const hgtDb = {
     },
 };
 
+// ─── Offline data folder (elevation originals + map imagery) ───────────────
+// Region and box downloads put the files here as downloaded, and generation
+// reads them before going to the network. Electron only: the web build has no
+// file system, so there the folder is unavailable and generation works as before.
+const offlineStore = {
+    available() {
+        return !globalThis.__INAV_BROWSER_BUILD__ && typeof globalThis.electronAPI?.downloadToFile === 'function';
+    },
+
+    defaultDir() {
+        return globalThis.electronAPI.appGetPath('userData') + '/offline_terrain';
+    },
+
+    dir() {
+        return store.get('mapgen_offline_dir', '') || this.defaultDir();
+    },
+
+    path(rel) {
+        return this.dir() + '/' + rel;
+    },
+
+    async read(rel) {
+        if (!this.available()) return null;
+        const r = await globalThis.electronAPI.readFile(this.path(rel), null);
+        if (!r || r.error || !r.data) return null;
+        return r.data instanceof Uint8Array ? r.data : new Uint8Array(r.data);
+    },
+
+    async write(rel, bytes) {
+        if (!this.available()) return;
+        const err = await globalThis.electronAPI.writeFileAtomic(this.path(rel), bytes);
+        if (err) throw new Error(err);
+    },
+
+    // File names present in elevation/<source>/.
+    async elevationNames(source) {
+        if (!this.available()) return new Set();
+        const files = await globalThis.electronAPI.listFiles(this.path('elevation/' + source));
+        return new Set(files.map(f => f.name));
+    },
+};
+
+// The storage that js/terrain_elevation.js reads and writes during generation.
+function makeTerrainIo() {
+    const folder = offlineStore.available();
+    return {
+        hgtDb,
+        hasFile: (source, lat, lon) => hasCellFile(source, lat, lon),
+        readLocal: folder ? rel => offlineStore.read(rel) : null,
+        saveLocal: folder ? (rel, bytes) => offlineStore.write(rel, bytes) : null,
+    };
+}
+
+// ─── Map tiles from the offline folder ─────────────────────────────────────
+// A tile layer that shows imagery/<provider>/<type>/z/x/y.<ext> from the
+// offline folder when it is there (region downloads put it there). Otherwise
+// it loads the tile from the network and, while the tile cache is enabled,
+// saves it (the browse cache), so places looked at online also show offline.
+// Tiles saved while browsing count against the tile cache's max size; region
+// downloads don't. A server that refuses CORS gets a plain <img>, not saved.
+const IMAGE_MIME = { jpg: 'image/jpeg', png: 'image/png' };
+
+const browseCache = {
+    bytes() { return store.get('mapgen_browse_cache_bytes', 0); },
+    reset() { store.set('mapgen_browse_cache_bytes', 0); },
+    canSave() {
+        return store.get('mapgen_cache_enabled', true) &&
+            this.bytes() < store.get('mapgen_cache_max_mb', 500) * 1024 * 1024;
+    },
+    async save(rel, bytes) {
+        try {
+            await offlineStore.write(rel, bytes);
+            store.set('mapgen_browse_cache_bytes', this.bytes() + bytes.length);
+        } catch (_) { /* a failed save only costs a re-download later */ }
+    },
+};
+
+function showTileBytes(tile, bytes, ext) {
+    const url = URL.createObjectURL(new Blob([bytes], { type: IMAGE_MIME[ext] || 'image/jpeg' }));
+    const revoke = () => URL.revokeObjectURL(url);
+    tile.addEventListener('load', revoke, { once: true });
+    tile.addEventListener('error', revoke, { once: true });
+    tile.src = url;
+}
+
+const CachedTileLayer = L.TileLayer.extend({
+    // options.offlineKey = { provider, type, ext } names the folder the tiles live in.
+    createTile(coords, done) {
+        const key = this.options.offlineKey;
+        if (!key || !offlineStore.available()) {
+            return L.TileLayer.prototype.createTile.call(this, coords, done);
+        }
+        const tile = document.createElement('img');
+        L.DomEvent.on(tile, 'load', L.Util.bind(this._tileOnLoad, this, done, tile));
+        L.DomEvent.on(tile, 'error', L.Util.bind(this._tileOnError, this, done, tile));
+        tile.alt = '';
+        tile.setAttribute('role', 'presentation');
+
+        const url = this.getTileUrl(coords);
+        const rel = imageryLocalPath(key.provider, key.type, this._getZoomForUrl(), coords.x, coords.y, key.ext);
+        void (async () => {
+            const local = await offlineStore.read(rel);
+            if (local) {
+                showTileBytes(tile, local, key.ext);
+                return;
+            }
+            let bytes = null;
+            try {
+                const resp = await fetch(url);
+                if (resp.ok) bytes = new Uint8Array(await resp.arrayBuffer());
+            } catch (_) { /* offline, or no CORS: fall back to a plain <img> */ }
+            if (!bytes) {
+                if (this.options.crossOrigin || this.options.crossOrigin === '') {
+                    tile.crossOrigin = this.options.crossOrigin === true ? '' : this.options.crossOrigin;
+                }
+                tile.src = url;
+                return;
+            }
+            showTileBytes(tile, bytes, key.ext);
+            if (browseCache.canSave()) void browseCache.save(rel, bytes);
+        })();
+        return tile;
+    },
+});
+
+function cachedTileLayer(url, options, provider, type, ext) {
+    return new CachedTileLayer(url, { ...options, offlineKey: { provider, type, ext } });
+}
+
+// Set while the tab is open; cleanup() calls it to stop an offline download.
+let stopOfflineDownload = null;
+
+function boundsCells(bounds) {
+    return cellsForBounds(bounds.getSouth(), bounds.getWest(), bounds.getNorth(), bounds.getEast());
+}
+
 // ─── Tab lifecycle ──────────────────────────────────────────────────────
 TABS.map_generator.initialize = function (callback) {
     // Must be the tab object, not its name — GUI.tab_switch_cleanup() calls
@@ -893,6 +591,8 @@ TABS.map_generator.initialize = function (callback) {
     }
 
     void hgtDb.dropOldCopernicusGrids();
+    // Ask Chromium not to evict the IndexedDB elevation cache under disk pressure.
+    void navigator.storage?.persist?.().catch(() => {});
 
     loadHtml();
 
@@ -917,6 +617,8 @@ TABS.map_generator.initialize = function (callback) {
         let liveAltCache = {};
         let preTerrainZoom = null;
         let terrainFallbackPending = false;
+        let offlineJob = null;              // the offline download shown in the modal, if any
+        let offlinePresent = { srtm: new Set(), copernicus: new Set() };   // file names in the offline folder
 
         // ── Initialize tile cache ───────────────────────────────────
         tileCache.init();
@@ -1048,13 +750,13 @@ TABS.map_generator.initialize = function (callback) {
         const googleAttr   = 'Map data &copy; <a href="https://www.google.com/intl/en/help/terms_maps/">Google</a>';
         const maptilerAttr = '&copy; <a href="https://www.maptiler.com/copyright/">MapTiler</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
 
-        const osmLayer       = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 20, attribution: osmAttr });
-        const esriSatellite  = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 20, crossOrigin: true, attribution: esriAttr });
-        const esriStreet     = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', { maxZoom: 20, crossOrigin: true, attribution: esriAttr });
-        const esriLabels     = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}', { maxZoom: 20, crossOrigin: true, pane: 'shadowPane' });
-        const googleSatellite = L.tileLayer('https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', { maxZoom: 20, attribution: googleAttr });
-        const googleStreet   = L.tileLayer('https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}', { maxZoom: 20, attribution: googleAttr });
-        const googleHybrid   = L.tileLayer('https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', { maxZoom: 20, attribution: googleAttr });
+        const osmLayer       = cachedTileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 20, attribution: osmAttr }, 'OSM', 'Street', 'png');
+        const esriSatellite  = cachedTileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 20, crossOrigin: true, attribution: esriAttr }, 'ESRI', 'Satellite', 'jpg');
+        const esriStreet     = cachedTileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', { maxZoom: 20, crossOrigin: true, attribution: esriAttr }, 'ESRI', 'Street', 'jpg');
+        const esriLabels     = cachedTileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}', { maxZoom: 20, crossOrigin: true, pane: 'shadowPane' }, 'ESRI', 'Labels', 'png');
+        const googleSatellite = cachedTileLayer('https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', { maxZoom: 20, attribution: googleAttr }, 'GOOGLE', 'Satellite', 'jpg');
+        const googleStreet   = cachedTileLayer('https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}', { maxZoom: 20, attribution: googleAttr }, 'GOOGLE', 'Street', 'png');
+        const googleHybrid   = cachedTileLayer('https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', { maxZoom: 20, attribution: googleAttr }, 'GOOGLE', 'Hybrid', 'jpg');
 
         function getMaptilerLayer(type) {
             const key   = $('#mapgen_maptiler_key').val().trim();
@@ -1062,7 +764,7 @@ TABS.map_generator.initialize = function (callback) {
             const style = styleMap[type] || 'streets-v2';
             const pngTypes = new Set(['Street', 'OSM Style', 'Outdoor', 'Topo', 'Winter']);
             const ext   = pngTypes.has(type) ? 'png' : 'jpg';
-            return L.tileLayer(`https://api.maptiler.com/maps/${style}/{z}/{x}/{y}.${ext}?key=${key}`, { maxZoom: 20, crossOrigin: true, attribution: maptilerAttr });
+            return cachedTileLayer(`https://api.maptiler.com/maps/${style}/{z}/{x}/{y}.${ext}?key=${key}`, { maxZoom: 20, crossOrigin: true, attribution: maptilerAttr }, 'MAPTILER', style, ext);
         }
 
         currentLayer = osmLayer;
@@ -1567,6 +1269,7 @@ TABS.map_generator.initialize = function (callback) {
             store.set('mapgen_terrain_source', $('#mapgen_terrain_source').val());
             updateTerrainSourceUI();
             triggerUpdate();
+            if (isTerrainMode()) updateTerrainGrid();
         });
         $('#mapgen_provider').on('change', () => { syncMapOptions(); switchMapLayer(); });
         $('#mapgen_maptype').on('change', () => { switchMapLayer(); });
@@ -1778,12 +1481,20 @@ TABS.map_generator.initialize = function (callback) {
 
         $('#mapgen_modal_cancel').on('click', (e) => {
             e.preventDefault();
+            if (offlineJob) {
+                offlineCancelClicked();
+                return;
+            }
             syncAborted = true;
             hideModal();
         });
 
         $('#mapgen_modal_confirm').on('click', async (e) => {
             e.preventDefault();
+            if (offlineJob) {
+                await offlineConfirmClicked();
+                return;
+            }
             // Confirming the "Copernicus unavailable" prompt is the user's
             // explicit consent to switch elevation source for this generation.
             if (terrainFallbackPending) {
@@ -1965,6 +1676,7 @@ TABS.map_generator.initialize = function (callback) {
         // updateTerrainMode() call bailed on the `if (!map) return` guard. Without this,
         // defaulting to (or restoring) the terrain target leaves the tab in tile-mode UI.
         // No-op for tile targets.
+        initOfflinePanel();
         updateTerrainMode();
 
         // ── Terrain helper functions ────────────────────────────────
@@ -2006,13 +1718,14 @@ TABS.map_generator.initialize = function (callback) {
         // Copernicus is fetched from a public bucket — if it cannot be reached,
         // ask before falling back to SRTM. Never switch elevation source
         // silently: the user must know which source produced the files.
-        function showCopernicusFallbackPrompt() {
+        function showCopernicusFallbackPrompt(err) {
             $('#mapgen_download_status').text('Copernicus server unavailable.');
             $('#mapgen_progress_section').hide();
             $('#mapgen_modal_actions').show();
             $('#mapgen_sync_info').html(
                 '<div style="color:#aaa; font-size:13px; line-height:1.6; margin:8px 0;">' +
-                '<b style="color:#ff9800;">Copernicus GLO-30 is unavailable</b> (server unreachable or throttling).<br><br>' +
+                '<b style="color:#ff9800;">Copernicus GLO-30 is unavailable</b> (server unreachable or throttling).<br>' +
+                (err ? $('<span>').text(err.message).html() + '.<br>' : '') + '<br>' +
                 'You can switch this generation to the <b>NASA SRTM1</b> fallback source (real SRTM between 60°N and 56°S, coarse fill data beyond), ' +
                 'or close and try Copernicus again later.</div>');
             terrainFallbackPending = true;
@@ -2047,6 +1760,21 @@ TABS.map_generator.initialize = function (callback) {
                 L.polyline([[latMin - 1, lon], [latMax + 1, lon]], {
                     color: '#ff6600', weight: 1, opacity: 0.5, dashArray: '6,4', interactive: false,
                 }).addTo(terrainGridLayer);
+            }
+
+            // Shade cells whose elevation data (with edge neighbours) is in
+            // the offline folder. Skipped when zoomed far out: too many cells.
+            if (offlineStore.available() && (latMax - latMin) * (lonMax - lonMin) <= 4000) {
+                const source = getTerrainSource();
+                const readyStyle = { color: '#00e676', weight: 1, opacity: 0.8, fillColor: '#00e676', fillOpacity: 0.22, interactive: false };
+                for (let lat = Math.max(latMin, -90); lat < Math.min(latMax, 90); lat++) {
+                    for (let lon = lonMin; lon < lonMax; lon++) {
+                        const wrapped = ((lon + 180) % 360 + 360) % 360 - 180;
+                        if (cellReadyOffline(source, lat, wrapped)) {
+                            L.rectangle([[lat, lon], [lat + 1, lon + 1]], readyStyle).addTo(terrainGridLayer);
+                        }
+                    }
+                }
             }
 
             const selLayer = drawnItems.getLayers()[0];
@@ -2105,7 +1833,7 @@ TABS.map_generator.initialize = function (callback) {
             const latlngs = layer.getLatLngs()[0];
             const area = L.GeometryUtil.geodesicArea(latlngs);
             const unit = $('#mapgen_area_unit').val();
-            const tiles = getTerrainDegreeTiles(bounds);
+            const tiles = boundsCells(bounds);
             const estSizeMB = tiles.reduce((s, t) => s + estimateDatSizeMB(t.lat), 0).toFixed(0);
             const fileList = tiles.map(t => terrainDatFilename(t.lat, t.lon));
             const midLat = (bounds.getNorth() + bounds.getSouth()) / 2;
@@ -2153,8 +1881,7 @@ TABS.map_generator.initialize = function (callback) {
 
             // Hide tile-specific controls in terrain mode
             // Provider, map type, project name, zoom row — always visible when not terrain
-            $('#mapgen_provider').closest('.select').toggle(!isTerrain);
-            $('#mapgen_maptype').closest('.select').toggle(!isTerrain);
+            // Provider and map type stay visible: in terrain mode they pick the map imagery.
             $('#mapgen_project_name').closest('.number').toggle(!isTerrain);
             $('.mapgen-zoom-row').toggle(!isTerrain);
             // Warnings and subtarget: only force-hide in terrain mode
@@ -2163,6 +1890,7 @@ TABS.map_generator.initialize = function (callback) {
                 $('#mapgen_subtarget_wrapper').addClass('mapgen-subtarget-hidden');
                 $('#mapgen_google_warning').hide();
                 $('#mapgen_yaapu_warning').hide();
+                $('#mapgen_osm_warning').hide();
             }
             // Hints
             $('#mapgen_hint_tiles').toggle(!isTerrain);
@@ -2173,15 +1901,9 @@ TABS.map_generator.initialize = function (callback) {
                 $('#mapgen_terrain_alt_toggle').prop('checked', false);
                 toggleLiveAlt();
             }
-            // Force OSM in terrain mode
-            if (isTerrain) {
-                if (currentLayer) map.removeLayer(currentLayer);
-                if (map.hasLayer(esriLabels)) map.removeLayer(esriLabels);
-                currentLayer = osmLayer;
-                currentLayer.addTo(map);
-            } else {
-                switchMapLayer();
-            }
+            // The map keeps the chosen provider and type in terrain mode too, so
+            // imagery downloaded for offline use (Esri) can be shown.
+            switchMapLayer();
             // SD card label
             updateSdLabel();
 
@@ -2195,6 +1917,10 @@ TABS.map_generator.initialize = function (callback) {
             } else {
                 $('#mapgen_clear_hgt_cache').hide();
             }
+            // Offline data panel: terrain mode, desktop app only (needs a folder)
+            const showOffline = isTerrain && offlineStore.available();
+            $('#mapgen_offline_box').toggle(showOffline);
+            if (showOffline) void refreshOfflineView();
 
             // Toggle cache UI: tile cache controls for map targets, HGT button for terrain
             $('.mapgen-cache-row').toggle(!isTerrain);
@@ -2243,7 +1969,7 @@ TABS.map_generator.initialize = function (callback) {
             try {
                 const cached = await hgtDb.cachedSet();
                 if (cached.size > 0 && isTerrainMode()) {
-                    $('#mapgen_clear_hgt_cache').text(`Clear Elevation Cache (${cached.size} tile${cached.size > 1 ? 's' : ''}, ~${cached.size * 25} MB)`).show();
+                    $('#mapgen_clear_hgt_cache').text(`Clear Elevation Cache (${cached.size} tile${cached.size > 1 ? 's' : ''}, ~${formatBytes(cached.size * HGT_GRID_BYTES)})`).show();
                 } else {
                     $('#mapgen_clear_hgt_cache').hide();
                 }
@@ -2255,10 +1981,361 @@ TABS.map_generator.initialize = function (callback) {
         $('#mapgen_clear_hgt_cache').on('click', async () => {
             const cached = await hgtDb.cachedSet();
             if (cached.size === 0) return;
-            if (!globalThis.electronAPI.confirmDialog(`Clear ${cached.size} cached elevation tile(s) (~${cached.size * 25} MB)?`)) return;
+            if (!await globalThis.electronAPI.confirmDialog(`Clear ${cached.size} cached elevation tile(s) (~${formatBytes(cached.size * HGT_GRID_BYTES)})?`)) return;
             await hgtDb.clear();
             liveAltCache = {};
             updateHgtCacheInfo();
+        });
+
+        // ── Offline data panel ──────────────────────────────────────
+        // Downloads elevation originals and Esri imagery into the offline
+        // folder (offlineStore). Files already there are skipped, so running
+        // the same download again resumes an interrupted one.
+        const OFFLINE_ELEVATION_CONCURRENCY = 2;
+        const OFFLINE_IMAGERY_CONCURRENCY = 4;
+
+        function initOfflinePanel() {
+            const $region = $('#mapgen_offline_region').empty();
+            $region.append($('<option>').val('box').text('Drawn box'));
+            for (const r of REGIONS) $region.append($('<option>').val(r.id).text(r.name));
+            const savedRegion = store.get('mapgen_offline_region', 'box');
+            $region.val(regionById(savedRegion) ? savedRegion : 'box');
+
+            const $zoom = $('#mapgen_offline_zoom').empty();
+            $zoom.append($('<option>').val('-1').text('No imagery'));
+            for (let z = 0; z <= BOX_IMAGERY_ZOOM; z++) $zoom.append($('<option>').val(String(z)).text(String(z)));
+            setOfflineDefaultZoom();
+            updateOfflineDirLabel();
+        }
+
+        function setOfflineDefaultZoom() {
+            const r = regionById($('#mapgen_offline_region').val());
+            $('#mapgen_offline_zoom').val(String(r ? r.imageryZoom : BOX_IMAGERY_ZOOM));
+        }
+
+        function updateOfflineDirLabel() {
+            if (!offlineStore.available()) return;
+            $('#mapgen_offline_dir').text(offlineStore.dir());
+        }
+
+        async function refreshOfflinePresent() {
+            if (!offlineStore.available()) return;
+            offlinePresent = {
+                srtm: await offlineStore.elevationNames('srtm'),
+                copernicus: await offlineStore.elevationNames('copernicus'),
+            };
+        }
+
+        // A cell is ready offline when its own file and the E/N/NE neighbour
+        // files its edges are filled from are all in the folder.
+        function cellReadyOffline(source, lat, lon) {
+            if (!hasCellFile(source, lat, lon)) return false;
+            return withNeighbours([{ lat, lon }], source).every(c =>
+                !hasCellFile(source, c.lat, c.lon) || offlinePresent[source].has(elevationFileName(source, c.lat, c.lon)));
+        }
+
+        async function updateOfflineSizes() {
+            if (!offlineStore.available()) return;
+            const parts = [
+                ['elevation/copernicus', 'Copernicus'],
+                ['elevation/srtm', 'SRTM'],
+                ['imagery', 'Imagery'],
+            ];
+            const rows = [];
+            for (const [rel, label] of parts) {
+                const s = await globalThis.electronAPI.dirSize(offlineStore.path(rel));
+                if (!s?.files) continue;
+                rows.push(`<div>${label}: ${s.files.toLocaleString()} file${s.files > 1 ? 's' : ''}, ${formatBytes(s.bytes)}` +
+                    `<a href="#" class="mapgen-offline-clear" data-rel="${rel}" data-label="${label}">Clear</a></div>`);
+            }
+            $('#mapgen_offline_sizes').html(rows.join('') || 'The folder has no offline data yet.');
+        }
+
+        async function refreshOfflineView() {
+            await refreshOfflinePresent();
+            if (isTerrainMode()) updateTerrainGrid();
+            await updateOfflineSizes();
+        }
+
+        function offlineLayers() {
+            const ids = [];
+            if ($('#mapgen_offline_sat').is(':checked')) ids.push('esri_satellite');
+            if ($('#mapgen_offline_street').is(':checked')) ids.push('esri_street');
+            if ($('#mapgen_offline_labels').is(':checked')) ids.push('esri_labels');
+            return ids;
+        }
+
+        // The cells and imagery bounds of the chosen region or the drawn box.
+        function offlineArea() {
+            const r = regionById($('#mapgen_offline_region').val());
+            if (r) {
+                return {
+                    name: r.name, cells: cellsForRange(r),
+                    bounds: { south: r.lat0, west: r.lon0, north: r.lat1 + 1, east: r.lon1 + 1 },
+                };
+            }
+            const layer = drawnItems.getLayers()[0];
+            if (!layer) return null;
+            const b = layer.getBounds();
+            return {
+                name: 'Drawn box', cells: boundsCells(b),
+                bounds: { south: b.getSouth(), west: b.getWest(), north: b.getNorth(), east: b.getEast() },
+            };
+        }
+
+        function offlineInfoRow(label, value) {
+            return `<div class="mapgen-info-row"><span>${label}</span><span>${value}</span></div>`;
+        }
+
+        async function showOfflineConfirm() {
+            const area = offlineArea();
+            if (!area) {
+                $('#mapgen_status').text('Draw a rectangle first, or pick a region in Offline Data.');
+                return;
+            }
+            const source = getTerrainSource();
+            const other = source === 'srtm' ? 'copernicus' : 'srtm';
+            const sourceName = { srtm: 'NASA SRTM1', copernicus: 'Copernicus GLO-30' };
+            const zMax = Number.parseInt($('#mapgen_offline_zoom').val(), 10);
+            const layers = zMax >= 0 ? offlineLayers() : [];
+
+            await refreshOfflinePresent();
+            const plan = planDownload({
+                cells: area.cells,
+                present: offlinePresent,
+                imagery: layers.length ? { ...area.bounds, zMax, layers } : null,
+            });
+            const el = plan.elevation[source];
+            const elOther = plan.elevation[other];
+            const imageryBytes = plan.imagery?.bytes || 0;
+            const needBytes = el.missingBytes + imageryBytes;
+            const free = await globalThis.electronAPI.diskFree(offlineStore.dir());
+            const tooBig = free !== null && free !== undefined && free < needBytes;
+
+            const esc = s => $('<span>').text(s).html();
+            let html =
+                offlineInfoRow('Region:', esc(area.name)) +
+                offlineInfoRow('Folder:', `<span style="font-size:11px;">${esc(offlineStore.dir())}</span>`) +
+                offlineInfoRow('Elevation source:', sourceName[source]) +
+                offlineInfoRow('1° cells:', `${plan.cells.toLocaleString()} (${el.cells.toLocaleString()} with edge neighbours)`) +
+                offlineInfoRow('Elevation files:', `${el.files.toLocaleString()} · ${el.present.toLocaleString()} already in folder · ${el.missing.length.toLocaleString()} to download`) +
+                offlineInfoRow('Elevation download:', `${formatBytes(el.missingBytes)} (all files: ${formatBytes(el.totalBytes)})`) +
+                offlineInfoRow(`${sourceName[other]} instead:`, `${formatBytes(elOther.totalBytes)} for ${elOther.files.toLocaleString()} files`);
+            if (plan.imagery) {
+                const names = { esri_satellite: 'satellite', esri_street: 'street', esri_labels: 'labels' };
+                html += offlineInfoRow('Imagery:', `Esri ${plan.imagery.layers.map(id => names[id]).join(' + ')}, zoom 0–${plan.imagery.zMax}`) +
+                    offlineInfoRow('Imagery tiles:', `${plan.imagery.files.toLocaleString()} files, about ${formatBytes(imageryBytes)} (tiles already saved are skipped)`);
+            } else {
+                html += offlineInfoRow('Imagery:', 'none');
+            }
+            html += offlineInfoRow('Total download:', `up to ${formatBytes(needBytes)}`) +
+                offlineInfoRow('Free space:', free === null || free === undefined ? 'unknown'
+                    : (tooBig ? `<span class="mapgen-offline-warn">${formatBytes(free)} — not enough</span>` : formatBytes(free))) +
+                offlineInfoRow('Time at 100 Mbit/s:', needBytes > 0 ? formatDuration(plan.seconds[source]) : '—') +
+                offlineInfoRow('.TER files if generated:', `${formatBytes(plan.terBytes[source])} (on the SD card, not in this folder)`);
+
+            const notes = [];
+            notes.push(source === 'copernicus'
+                ? esc(COPERNICUS_NOTICE_1) + '. ' + esc(COPERNICUS_NOTICE_2) + '.'
+                : 'NASA SRTM data is public domain. Outside 60°N–56°S this server only has coarse fill data.');
+            if (plan.imagery) {
+                notes.push('Esri tiles are saved for your own offline use only; don\'t share or publish them.');
+            }
+            notes.push(`Elevation data comes from public AWS buckets (index of ${CELL_INDEX_INFO.date}). Files download ${OFFLINE_ELEVATION_CONCURRENCY} at a time, imagery ${OFFLINE_IMAGERY_CONCURRENCY} at a time. Abort at any time; running the same download again picks up where it stopped.`);
+            html += `<div class="mapgen-offline-note">${notes.join('<br>')}</div>`;
+
+            const nothingToDo = el.missing.length === 0 && !plan.imagery;
+            if (nothingToDo) {
+                html += '<div class="mapgen-offline-note"><b>Everything for this area is already in the folder.</b></div>';
+            } else if (tooBig) {
+                html += '<div class="mapgen-offline-note mapgen-offline-warn">Not enough free space on that drive. Pick a smaller area, lower the imagery zoom, or choose another folder.</div>';
+            }
+
+            offlineJob = { state: 'confirm', source, plan };
+            $('#mapgen_sync_info').html(html);
+            $('#mapgen_modal_header').text('Download for Offline Use');
+            $('#mapgen_progress_section').hide();
+            $('#mapgen_modal_actions').show();
+            $('#mapgen_modal_confirm').text('Download').toggle(!nothingToDo && !tooBig);
+            $('#mapgen_modal_cancel').text(nothingToDo || tooBig ? 'Close' : 'Cancel');
+            showModal();
+        }
+
+        function* offlineImageryItems(imagery) {
+            for (const t of tilesInRanges(imagery.ranges)) {
+                for (const id of imagery.layers) {
+                    const layer = IMAGERY_LAYERS[id];
+                    yield {
+                        kind: 'imagery',
+                        url: layer.url(t.z, t.x, t.y),
+                        path: imageryLocalPath(layer.provider, layer.type, t.z, t.x, t.y, layer.ext),
+                        estBytes: layer.avgBytes,
+                    };
+                }
+            }
+        }
+
+        function offlineElevationItems(source, cells) {
+            return cells.map(c => {
+                const f = elevationFile(source, c.lat, c.lon);
+                return { kind: 'elevation', url: f.url, path: f.path, estBytes: cellFileBytes(source, c.lat, c.lon) };
+            });
+        }
+
+        // Runs `workers` downloads at a time from a shared iterator.
+        async function runOfflineQueue(iter, workers, job) {
+            await Promise.all(Array.from({ length: workers }, async () => {
+                for (;;) {
+                    while (job.paused && !job.aborted) await new Promise(r => setTimeout(r, 250));
+                    if (job.aborted) return;
+                    const next = iter.next();
+                    if (next.done) return;
+                    const item = next.value;
+                    const res = await globalThis.electronAPI.downloadToFile(item.url, offlineStore.path(item.path), { skipIfExists: true });
+                    if (job.aborted && res.status === 'error') return;   // cut off by Abort, not a failure
+                    job.done++;
+                    job.leftBytes = Math.max(0, job.leftBytes - item.estBytes);
+                    if (res.status === 'exists') {
+                        job.skipped++;
+                    } else if (res.status === 404) {
+                        job.notFound++;
+                    } else if (typeof res.status === 'number' && res.status >= 200 && res.status < 300) {
+                        job.bytes += res.bytes;
+                        job.downloaded++;
+                    } else {
+                        item.error = res.error || `HTTP ${res.status}`;
+                        job.failed.push(item);
+                    }
+                }
+            }));
+        }
+
+        function renderOfflineProgress(job) {
+            const now = Date.now();
+            job.samples.push([now, job.bytes]);
+            while (job.samples.length > 2 && now - job.samples[0][0] > 10000) job.samples.shift();
+            const [t0, b0] = job.samples[0];
+            const speed = now > t0 ? (job.bytes - b0) / ((now - t0) / 1000) : 0;
+            const pct = job.total > 0 ? job.done / job.total * 100 : 100;
+            $('#mapgen_progress_fill').css('width', pct + '%');
+            let text = `${job.done.toLocaleString()} / ${job.total.toLocaleString()} files · ${formatBytes(job.bytes)} downloaded`;
+            if (job.paused) {
+                text += ' · Paused (files in progress finish first)';
+            } else if (speed > 0) {
+                text += ` · ${formatBytes(speed)}/s · ${formatDuration(job.leftBytes / speed)} left`;
+            }
+            if (job.failed.length) text += ` · Failed: ${job.failed.length}`;
+            $('#mapgen_download_status').text(text);
+        }
+
+        async function runOfflineDownload(elevationItems, imageryIter, imageryCount) {
+            const job = offlineJob;
+            Object.assign(job, {
+                state: 'running', paused: false, aborted: false,
+                total: elevationItems.length + imageryCount,
+                leftBytes: elevationItems.reduce((s, i) => s + i.estBytes, 0) + (imageryCount ? job.plan.imagery.bytes / job.plan.imagery.files * imageryCount : 0),
+                done: 0, downloaded: 0, skipped: 0, notFound: 0, bytes: 0, failed: [],
+                samples: [],
+            });
+
+            $('#mapgen_progress_section').show();
+            $('#mapgen_progress_fill').css('width', '0%');
+            $('#mapgen_modal_confirm').show().text('Pause');
+            $('#mapgen_modal_cancel').text('Abort');
+            renderOfflineProgress(job);
+            const timer = setInterval(() => renderOfflineProgress(job), 500);
+            try {
+                await Promise.all([
+                    runOfflineQueue(elevationItems[Symbol.iterator](), OFFLINE_ELEVATION_CONCURRENCY, job),
+                    runOfflineQueue(imageryIter, OFFLINE_IMAGERY_CONCURRENCY, job),
+                ]);
+            } finally {
+                clearInterval(timer);
+            }
+            renderOfflineProgress(job);
+
+            job.state = 'done';
+            let summary = job.aborted ? 'Stopped. ' : 'Finished. ';
+            summary += `${job.downloaded.toLocaleString()} downloaded (${formatBytes(job.bytes)}), ${job.skipped.toLocaleString()} already in folder`;
+            if (job.notFound) summary += `, ${job.notFound.toLocaleString()} not on the server`;
+            if (job.failed.length) summary += `, ${job.failed.length.toLocaleString()} failed (first: ${job.failed[0].error})`;
+            summary += '.';
+            if (job.aborted) summary += ' Run the same download again to resume.';
+            $('#mapgen_download_status').text(summary);
+            $('#mapgen_modal_confirm').text('Retry Failed').toggle(job.failed.length > 0 && !job.aborted);
+            $('#mapgen_modal_cancel').text('Close');
+            await refreshOfflineView();
+        }
+
+        async function offlineConfirmClicked() {
+            const job = offlineJob;
+            if (job.state === 'confirm') {
+                const plan = job.plan;
+                const elevation = offlineElevationItems(job.source, plan.elevation[job.source].missing);
+                const imageryIter = plan.imagery ? offlineImageryItems(plan.imagery) : [][Symbol.iterator]();
+                await runOfflineDownload(elevation, imageryIter, plan.imagery?.files || 0);
+            } else if (job.state === 'running') {
+                job.paused = !job.paused;
+                $('#mapgen_modal_confirm').text(job.paused ? 'Resume' : 'Pause');
+                renderOfflineProgress(job);
+            } else if (job.state === 'done' && job.failed.length) {
+                const failed = job.failed;
+                const elevation = failed.filter(i => i.kind === 'elevation');
+                const imagery = failed.filter(i => i.kind === 'imagery');
+                await runOfflineDownload(elevation, imagery[Symbol.iterator](), imagery.length);
+            }
+        }
+
+        function offlineCancelClicked() {
+            const job = offlineJob;
+            if (job.state === 'running') {
+                stopOfflineDownload();
+                $('#mapgen_download_status').text('Stopping…');
+                return;
+            }
+            offlineJob = null;
+            hideModal();
+        }
+
+        stopOfflineDownload = () => {
+            if (offlineJob?.state !== 'running') return;
+            offlineJob.aborted = true;
+            offlineJob.paused = false;
+            void globalThis.electronAPI.abortDownloads();
+        };
+
+        $('#mapgen_offline_region').on('change', () => {
+            store.set('mapgen_offline_region', $('#mapgen_offline_region').val());
+            setOfflineDefaultZoom();
+        });
+
+        $('#mapgen_offline_change').on('click', async (e) => {
+            e.preventDefault();
+            const result = await globalThis.electronAPI.showOpenDialog({
+                title: 'Select Offline Data Folder',
+                defaultPath: offlineStore.dir(),
+                properties: ['openDirectory', 'createDirectory'],
+            });
+            if (result.canceled || !result.filePaths?.length) return;
+            store.set('mapgen_offline_dir', result.filePaths[0]);
+            updateOfflineDirLabel();
+            await refreshOfflineView();
+        });
+
+        $('#mapgen_offline_download').on('click', (e) => {
+            e.preventDefault();
+            void showOfflineConfirm();
+        });
+
+        $('#mapgen_offline_sizes').on('click', '.mapgen-offline-clear', async (e) => {
+            e.preventDefault();
+            const rel = $(e.currentTarget).data('rel');
+            const label = $(e.currentTarget).data('label');
+            if (!await globalThis.electronAPI.confirmDialog(`Delete all ${label} files from the offline folder?\n${offlineStore.path(rel)}`)) return;
+            const err = await globalThis.electronAPI.rm(offlineStore.path(rel));
+            if (err) $('#mapgen_status').text('Could not clear: ' + err);
+            if (rel === 'imagery') browseCache.reset();
+            await refreshOfflineView();
         });
 
         // ── Terrain sync pipeline ───────────────────────────────────
@@ -2271,32 +2348,34 @@ TABS.map_generator.initialize = function (callback) {
 
             syncAborted = false;
             const bounds = layer.getBounds();
-            const tiles = getTerrainDegreeTiles(bounds);
+            const tiles = boundsCells(bounds);
             const fileList = tiles.map(t => terrainDatFilename(t.lat, t.lon));
             const totalSizeMB = tiles.reduce((s, t) => s + estimateDatSizeMB(t.lat), 0).toFixed(0);
 
-            // Compute all unique HGT keys needed (primaries + neighbors)
-            const hgtKeysSet = new Set();
-            tiles.forEach(t => {
-                hgtKeysSet.add(t.lat + '_' + t.lon);
-                hgtKeysSet.add(t.lat + '_' + (t.lon + 1));
-                hgtKeysSet.add((t.lat + 1) + '_' + t.lon);
-                hgtKeysSet.add((t.lat + 1) + '_' + (t.lon + 1));
-            });
-            const totalHgt = hgtKeysSet.size;
-            const cachedSetKeys = await hgtDb.cachedSet();
-            let cachedCount = 0;
-            const cachePrefix = getTerrainSource() === 'copernicus' ? COPERNICUS_CACHE_PREFIX : '';
-            hgtKeysSet.forEach(k => { if (cachedSetKeys.has(cachePrefix + k)) cachedCount++; });
-
+            // Every land cell the run reads (each cell plus its E/N/NE
+            // neighbours), and how many are already in the IndexedDB cache or
+            // the offline folder. Sea cells need no data.
             const copernicus = getTerrainSource() === 'copernicus';
-            const hgtSizeMB = (tiles.length * (copernicus ? 42 : 13)).toFixed(0);
+            const source = copernicus ? 'copernicus' : 'srtm';
+            const landCells = withNeighbours(tiles, source).filter(c => hasCellFile(source, c.lat, c.lon));
+            const cachedSetKeys = await hgtDb.cachedSet();
+            const folderNames = await offlineStore.elevationNames(source);
+            const cachePrefix = copernicus ? COPERNICUS_CACHE_PREFIX : '';
+            let cachedCount = 0;
+            landCells.forEach(c => {
+                if (cachedSetKeys.has(cachePrefix + cellKey(c)) || folderNames.has(elevationFileName(source, c.lat, c.lon))) {
+                    cachedCount++;
+                }
+            });
+            const plan = planDownload({ cells: tiles, present: { [source]: folderNames } });
             const sourceUnit = copernicus ? 'GLO-30 tiles' : 'HGT tiles';
-            const cacheInfo = cachedCount > 0
-                ? (cachedCount === totalHgt
-                    ? `<span style="color:#87b025;">All ${totalHgt} ${sourceUnit} cached \u2014 no download needed</span>`
-                    : `${cachedCount} of ${totalHgt} ${sourceUnit} cached`)
-                : `~${hgtSizeMB} MB`;
+            const totalHgt = landCells.length;
+            const cacheInfo = totalHgt === 0
+                ? 'None needed (sea)'
+                : cachedCount === totalHgt
+                    ? `<span style="color:#87b025;">Offline ready: all ${totalHgt} ${sourceUnit} cached \u2014 no download needed</span>`
+                    : `${cachedCount} of ${totalHgt} ${sourceUnit} cached; the rest needs internet ` +
+                      `(up to ${formatBytes(plan.elevation[source].missingBytes)})`;
 
             const hasSD = !!sdPath;
             let infoHtml = `
@@ -2326,16 +2405,24 @@ TABS.map_generator.initialize = function (callback) {
             showModal();
         }
 
+        // Ends a generation run that hit an error before anything was written.
+        function stopTerrainRun(err) {
+            $('#mapgen_download_status').text(`❌ ${err.message}. Generation stopped — no files were written.`);
+            $('#mapgen_modal_cancel').text('Close');
+            $('#mapgen_modal_confirm').hide();
+        }
+
         async function terrainGenerateAndSync() {
             const layer = drawnItems.getLayers()[0];
             if (!layer) return;
 
             syncAborted = false;
             const bounds = layer.getBounds();
-            const tiles = getTerrainDegreeTiles(bounds);
+            const tiles = boundsCells(bounds);
             const totalTiles = tiles.length;
             let completed = 0;
             const datFiles = [];
+            const terrainIo = makeTerrainIo();
             const hgtCache = {};
             const copernicusImages = {};
             const startTime = Date.now();
@@ -2367,11 +2454,15 @@ TABS.map_generator.initialize = function (callback) {
                                     : stage === 'edges' ? `🧩 Fetching ${name} edge data...`
                                         : `🧮 Building ${name} grid (${Math.round(a / b * 100)}%)`;
                             $('#mapgen_download_status').text(prefix + msg);
-                        });
+                        }, terrainIo);
                     } catch (e) {
                         if (syncAborted) break;
                         console.warn(`Copernicus fetch failed for ${name}:`, e.message);
-                        showCopernicusFallbackPrompt();
+                        if (e instanceof MissingElevationError) {
+                            showCopernicusFallbackPrompt(e);
+                        } else {
+                            stopTerrainRun(e);
+                        }
                         return;
                     }
                     if (!cellCache) {
@@ -2381,46 +2472,25 @@ TABS.map_generator.initialize = function (callback) {
                     }
                 }
 
-                // Download or use cached HGT data
-                if (!isCopernicus && !hgtCache[primaryKey]) {
-                    const cachedBuf = await hgtDb.get(primaryKey);
-                    if (cachedBuf) {
-                        hgtCache[primaryKey] = makeHgtView(new Uint8Array(cachedBuf));
-                        $('#mapgen_download_status').text(prefix + '\u2705 Cached ' + name);
-                    } else {
-                        $('#mapgen_download_status').text(prefix + '\u2b07\ufe0f Connecting to SRTM server...');
-                        try {
-                            const hgtData = await fetchSrtmTile(tile.lat, tile.lon, stage => {
-                                const msg = stage === 'connecting' ? '\u2b07\ufe0f Connecting to SRTM server...'
-                                    : stage === 'downloading' ? `\u2b07\ufe0f Downloading ${name}.hgt.gz...`
-                                    : `\ud83d\udce6 Decompressing ${name}...`;
-                                $('#mapgen_download_status').text(prefix + msg);
-                            });
-                            hgtCache[primaryKey] = makeHgtView(hgtData);
-                            hgtDb.put(primaryKey, hgtData.buffer || hgtData);
-                            $('#mapgen_download_status').text(prefix + `\u2705 Downloaded ${name} (${(hgtData.length / 1048576).toFixed(1)} MB)`);
-                        } catch (e) {
-                            console.warn(`SRTM fetch failed for ${name}:`, e.message);
-                            $('#mapgen_download_status').text(`Failed to download ${name}. Continuing...`);
-                        }
-                    }
-                }
-
-                // Fetch neighbor tiles for interpolation at edges
-                const neighbors = isCopernicus ? [] : [[tile.lat, tile.lon + 1], [tile.lat + 1, tile.lon], [tile.lat + 1, tile.lon + 1]];
-                for (const [nLat, nLon] of neighbors) {
-                    const nKey = nLat + '_' + nLon;
-                    if (!hgtCache[nKey]) {
-                        const cachedN = await hgtDb.get(nKey);
-                        if (cachedN) {
-                            hgtCache[nKey] = makeHgtView(new Uint8Array(cachedN));
-                        } else {
-                            try {
-                                const nData = await fetchSrtmTile(nLat, nLon);
-                                hgtCache[nKey] = makeHgtView(nData);
-                                hgtDb.put(nKey, nData.buffer || nData);
-                            } catch (_) { /* adjacent tile not available */ }
-                        }
+                // SRTM: the cell and its E/N/NE neighbours, from the caches, the
+                // offline folder or the server. Data that exists but can't be had
+                // stops the run: a missing grid would come out as sea level.
+                if (!isCopernicus) {
+                    try {
+                        await ensureSrtmCellData(tile.lat, tile.lon, hgtCache, terrainIo, stage => {
+                            const msg = stage === 'cached' ? '✅ Cached ' + name
+                                : stage === 'local' ? '✅ From offline folder: ' + name
+                                    : stage === 'connecting' ? '⬇️ Connecting to SRTM server...'
+                                        : stage === 'downloading' ? `⬇️ Downloading ${name}.hgt.gz...`
+                                            : stage === 'downloaded' ? `✅ Downloaded ${name}`
+                                                : `📦 Decompressing ${name}...`;
+                            $('#mapgen_download_status').text(prefix + msg);
+                        });
+                    } catch (e) {
+                        if (syncAborted) break;
+                        console.warn(`SRTM data missing for ${name}:`, e.message);
+                        stopTerrainRun(e);
+                        return;
                     }
                 }
 
@@ -2591,5 +2661,7 @@ TABS.map_generator.initialize = function (callback) {
 };
 
 TABS.map_generator.cleanup = function (callback) {
+    // Leaving the tab stops an offline download; running it again resumes.
+    if (stopOfflineDownload) stopOfflineDownload();
     if (callback) callback();
 };

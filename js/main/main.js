@@ -12,6 +12,7 @@ import tcp from './tcp';
 import udp from './udp';
 import serial from './serial';
 import child_process from './child_process';
+import { downloadToFile, abortDownloads, writeFileAtomic, diskFree, listFiles, dirSize } from './offline_store';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -511,6 +512,20 @@ app.whenReady().then(() => {
       return false;
     }
   });
+
+  // Map Generator offline data folder (js/main/offline_store.js).
+  ipcMain.handle('downloadToFile', (_event, url, dest, opts) => downloadToFile(url, dest, opts));
+  ipcMain.handle('abortDownloads', () => abortDownloads());
+  ipcMain.handle('writeFileAtomic', (_event, dest, data) => writeFileAtomic(dest, data));
+  ipcMain.handle('diskFree', async (_event, dir) => {
+    try {
+      return await diskFree(dir);
+    } catch {
+      return null;
+    }
+  });
+  ipcMain.handle('listFiles', (_event, dir) => listFiles(dir));
+  ipcMain.handle('dirSize', (_event, dir) => dirSize(dir));
 
   ipcMain.handle('ejectDrive', (_event, driveLetter) => {
     return new Promise(resolve => {
