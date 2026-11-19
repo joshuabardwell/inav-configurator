@@ -160,6 +160,41 @@
                     </div>
                 </div>
 
+                <div id="mapgen_offline_box" class="config-section gui_box grey" style="display:none;">
+                    <div class="gui_box_titlebar">
+                        <div class="spacer_box_title" data-i18n="mapgenOfflineData">Offline Data</div>
+                    </div>
+                    <div class="spacer_box">
+                        <div class="mapgen-offline-hint" data-i18n="mapgenOfflineHint">Download elevation data and map imagery ahead of time, so .TER files can be made without internet.</div>
+                        <div class="mapgen-sd-path" id="mapgen_offline_dir"></div>
+                        <a id="mapgen_offline_change" class="btn" href="#" data-i18n="mapgenOfflineChangeFolder">Change Folder</a>
+
+                        <div class="select">
+                            <select id="mapgen_offline_region"></select>
+                            <label for="mapgen_offline_region"><span data-i18n="mapgenOfflineRegion">Region</span></label>
+                        </div>
+                        <div class="select">
+                            <select id="mapgen_offline_zoom"></select>
+                            <label for="mapgen_offline_zoom"><span data-i18n="mapgenOfflineZoom">Imagery to zoom</span></label>
+                        </div>
+                        <div class="checkbox mapgen-overwrite-row">
+                            <input type="checkbox" id="mapgen_offline_sat" checked />
+                            <label for="mapgen_offline_sat"><span data-i18n="mapgenOfflineSatellite">Esri satellite</span></label>
+                        </div>
+                        <div class="checkbox mapgen-overwrite-row">
+                            <input type="checkbox" id="mapgen_offline_street" />
+                            <label for="mapgen_offline_street"><span data-i18n="mapgenOfflineStreet">Esri street map</span></label>
+                        </div>
+                        <div class="checkbox mapgen-overwrite-row">
+                            <input type="checkbox" id="mapgen_offline_labels" checked />
+                            <label for="mapgen_offline_labels"><span data-i18n="mapgenOfflineLabels">Esri road labels</span></label>
+                        </div>
+                        <a id="mapgen_offline_download" class="btn" href="#" data-i18n="mapgenOfflineDownload">Download for Offline Use</a>
+
+                        <div id="mapgen_offline_sizes" class="mapgen-offline-sizes"></div>
+                    </div>
+                </div>
+
                 <div id="mapgen_status" class="mapgen-status" data-i18n="mapgenStatusDefault">Draw a rectangle on the map to select your area.</div>
             </div>
 
