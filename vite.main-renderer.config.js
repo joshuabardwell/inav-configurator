@@ -29,6 +29,11 @@ export default defineConfig((env) => {
     resolve: {
       preserveSymlinks: true,
     },
+    // JB's fork: the Configurator's own build label (js/forkBuildLabel.js), set by the
+    // packaging step from tools/build_label.sh. Empty here shows as "jb-dev".
+    define: {
+      __JB_BUILD_LABEL__: JSON.stringify(process.env.JB_BUILD_LABEL || ''),
+    },
     clearScreen: false,
   };
 });

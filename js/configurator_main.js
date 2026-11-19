@@ -18,7 +18,7 @@ import MSP from './msp';
 import MSPCodes  from './../js/msp/MSPCodes';
 import mspHelper  from './msp/MSPHelper';
 import update from './globalUpdates';
-import appUpdater from './appUpdater';
+import { configuratorBuildLabel, withLabel } from './forkBuildLabel';
 import CliAutoComplete from './CliAutoComplete'; 
 import { SITLProcess } from './sitl';
 import settingsCache from './settingsCache';
@@ -249,17 +249,19 @@ $(function() {
             'Electron: <strong>' + runtimeVersion + '</strong>, ' +
             i18n.getMessage('getConfiguratorVersion') + version + '</strong>');
 
-        $('#status-bar .version').text(version);
-        $('#logo .version').text(version);
+        // JB's fork: the build label after the version, so this app can't pass for the official one
+        const labelledVersion = withLabel(version, configuratorBuildLabel());
+        GUI.log(i18n.getMessage('configuratorBuildLabel', [configuratorBuildLabel()]));
+        $('#status-bar .version').text(labelledVersion);
+        $('#logo .version').text(labelledVersion);
         update.firmwareVersion();
 
         if (store.get('logopen', false)) {
             $("#showlog").trigger('click');
         }
 
-        if (store.get('update_notify', true)) { 
-            appUpdater.checkRelease(version);
-        }
+        // JB's fork: no release check. It compares against iNavFlight's releases and would
+        // offer the official Configurator as an "update".
         
 
         // log library versions in console to make version tracking easier

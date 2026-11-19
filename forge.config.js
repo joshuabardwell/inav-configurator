@@ -100,7 +100,7 @@ if (osxSign && hasApiKeyNotarize) {
 
 export default {
   packagerConfig: {
-    executableName: "inav-configurator",
+    executableName: "inav-configurator-jb",
     asar: false,
     icon: 'images/inav',
     osxSign,
@@ -155,7 +155,7 @@ export default {
       if (process.platform !== 'darwin') {
         return;
       }
-      for (const vol of ['/Volumes/INAV-Configurator', '/Volumes/INAV Configurator']) {
+      for (const vol of ['/Volumes/INAV-Configurator-JB', '/Volumes/INAV Configurator JB']) {
         try {
           execFileSync('/usr/bin/hdiutil', ['detach', vol, '-force'], { stdio: 'ignore' });
         } catch {
@@ -163,16 +163,18 @@ export default {
         }
       }
     },
-    // Uniform artifact file names
+    // Uniform artifact file names. JB's fork: INAV-Configurator-JB_Win64_<version>_<build label>,
+    // the label from JB_BUILD_LABEL (tools/build_label.sh), as on the firmware hex files.
     postMake: async (config, makeResults) => {
+      const label = process.env.JB_BUILD_LABEL || 'jb-dev';
       makeResults.forEach(result => {
-        var baseName = `${result.packageJSON.productName.replace(' ', '-')}_${result.platform}_${result.arch}_${result.packageJSON.version}`;
+        var baseName = `${result.packageJSON.productName.replaceAll(' ', '-')}_${result.platform}_${result.arch}_${result.packageJSON.version}_${label}`;
         result.artifacts.forEach(artifact => {
           var artifactStr = artifact.toString();
           var newPath = path.join(path.dirname(artifactStr), baseName + path.extname(artifactStr));
-          newPath = newPath.replace('Configurator_win32_ia32', 'Configurator_Win32');
-          newPath = newPath.replace('Configurator_win32_x64', 'Configurator_Win64');
-          newPath = newPath.replace('Configurator_darwin', 'Configurator_MacOS');
+          newPath = newPath.replace('-JB_win32_ia32', '-JB_Win32');
+          newPath = newPath.replace('-JB_win32_x64', '-JB_Win64');
+          newPath = newPath.replace('-JB_darwin', '-JB_MacOS');
           fs.renameSync(artifactStr, newPath);
           console.log('Artifact: ' + newPath);
         });
@@ -183,16 +185,17 @@ export default {
     {
       name: '@electron-forge/maker-wix',
       config: {
-        name: "INAV Configurator",
-        shortName: "INAV",
-        exe: "inav-configurator",
+        name: "INAV Configurator JB",
+        shortName: "INAV JB",
+        exe: "inav-configurator-jb",
         description: "Configurator for the open source flight controller software INAV.",
-        programFilesFolderName: "inav-configurator",
-        shortcutFolderName: "INAV",
+        programFilesFolderName: "inav-configurator-jb",
+        shortcutFolderName: "INAV JB",
         manufacturer: "The INAV open source project",
-        appUserModelId: "com.inav.configurator",
+        appUserModelId: "com.inav.configurator.jb",
         icon: path.join(__dirname, "./assets/windows/inav_installer_icon.ico"),
-        upgradeCode: "13606ff3-b0bc-4dde-8fac-805bc8aed2f8",
+        // JB's fork: its own upgrade code, so its installer never replaces the official app
+        upgradeCode: "246d85d2-b51c-4415-9c64-beb5bb4c7d64",
         ui: {
           enabled: false,
           chooseDirectory: true,
@@ -220,8 +223,8 @@ export default {
       config: {
         // Keep name and volume title identical and space-free. A mismatch makes
         // appdmg detach the wrong /Volumes path; spaces flake on CI hdiutil.
-        name: "INAV-Configurator",
-        title: "INAV-Configurator",
+        name: "INAV-Configurator-JB",
+        title: "INAV-Configurator-JB",
         background: "./assets/osx/dmg-background.png",
         icon: "./images/inav.icns"
       }
@@ -234,8 +237,8 @@ export default {
       name: '@electron-forge/maker-deb',
       config: {
         options: {
-          name: "inav-configurator",
-          productName: "INAV Configurator",
+          name: "inav-configurator-jb",
+          productName: "INAV Configurator JB",
           categories: ["Utility"],
           icon: "./assets/linux/icon/inav_icon_128.png",
           description: "Configurator for the open source flight controller software INAV.",
@@ -251,8 +254,8 @@ export default {
       name: '@electron-forge/maker-rpm',
       config: {
         options: {
-          name: "inav-configurator",
-          productName: "INAV Configurator",
+          name: "inav-configurator-jb",
+          productName: "INAV Configurator JB",
           license: "GPL-3.0",
           categories: ["Utility"],
           icon: "./assets/linux/icon/inav_icon_128.png",
