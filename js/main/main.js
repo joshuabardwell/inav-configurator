@@ -43,6 +43,11 @@ let bluetoothDeviceChooser = null;
 let btDeviceList = null;
 let selectBluetoothCallback = null;
 
+// JB's fork: the app is renamed "INAV Configurator JB", which would move its settings to a
+// folder of that name. Keep the official app's folder so both share settings, backups and SITL
+// profiles. Must run before the Store is created.
+app.setPath('userData', path.join(app.getPath('appData'), 'INAV Configurator'));
+
 const store = new Store();
 
 // Workaround for some Linux systems: https://github.com/electron/electron/issues/32760
