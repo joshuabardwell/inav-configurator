@@ -4,6 +4,8 @@ import { getLength } from 'ol/sphere';
 import { LineString } from 'ol/geom';
 import { fromLonLat } from 'ol/proj';
 import elevationFetch from './elevationFetch';
+import { getElevations, isLocalTerrainActive } from './elevationProvider.js';
+import { samplePathEvenly } from './mission_terrain.js';
 
 import MWNP from './mwnp';
 import Waypoint from './waypoint';
@@ -358,6 +360,7 @@ let WaypointCollection = function () {
         let altPoint2measure = [];
         let namePoint2measure = [];
         let refPoint2measure = [];
+        let flownWaypoints = [];   // the waypoint objects behind the lists above, in the same order
         let jumpDict = {};
         let nStart = 0;
         let nLoop = 0;
@@ -380,6 +383,7 @@ let WaypointCollection = function () {
                 namePoint2measure.push(self.getWaypoint(nStart).getLayerNumber()+1);
                 let useAbsoluteAlt = (self.getWaypoint(nStart).getP3() & (1 << 0));
                 refPoint2measure.push(useAbsoluteAlt);
+                flownWaypoints.push(self.getWaypoint(nStart));
                 nStart++;
             }
             else if (self.getWaypoint(nStart).getAction() == MWNP.WPTYPE.JUMP) {
@@ -407,7 +411,7 @@ let WaypointCollection = function () {
             }
         }
 
-        return [nLoop, point2measure, altPoint2measure, namePoint2measure, refPoint2measure];
+        return [nLoop, point2measure, altPoint2measure, namePoint2measure, refPoint2measure, flownWaypoints];
     }
 
     self.getDistance = function(display) {
@@ -456,6 +460,19 @@ let WaypointCollection = function () {
         }
 
         samples = Math.max(1, samples); // opentopodata rejects < 2 samples (we send samples+1)
+
+        // With a terrain folder chosen the profile is read from the .TER tiles, every
+        // 30 m (their grid spacing) instead of the 60 m / 99 samples the online source
+        // allows. Stretches the folder has no tile for are filled in from the online source.
+        if (isLocalTerrainActive() && point2measure.length >= 2) {
+            const localSamples = Math.max(1, Math.min(4000, Math.ceil(totalMissionDistance / 30)));
+            const path = samplePathEvenly(point2measure.map(item => ({lat: Number(item[0]), lon: Number(item[1])})), localSamples);
+            if (path.length === localSamples + 1) {
+                const results = await getElevations(path);
+                return [lengthMission, totalMissionDistance, localSamples, results.map(result => result.elevation == null ? 0 : result.elevation),
+                    altPoint2measure, namePoint2measure, refPoint2measure, results.map(result => result.source)];
+            }
+        }
 
         let elevation = [];
         let coordList = "";

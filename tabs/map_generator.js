@@ -13,6 +13,10 @@ import store from './../js/store';
 import { globalSettings, UnitType } from './../js/globalSettings';
 import JSZip from 'jszip';
 import { fromUrl, fromArrayBuffer } from 'geotiff';
+import {
+    TERRAIN_SPACING, TERRAIN_BLK_SPACE_X, TERRAIN_IO_BLOCK,
+    addOffset, eastBlocks, buildTerBlock, terrainPackerSelfTest, terrainDatFilename
+} from './../js/terrain_ter.js';
 
 // Fix Leaflet default marker icon paths (broken by bundlers)
 delete L.Icon.Default.prototype._getIconUrl;
@@ -356,46 +360,6 @@ const tileCache = {
 // ─── Elevation grid → .TER conversion engine ──────────────────────────────────
 const SRTM_BASE_URL = 'https://s3.amazonaws.com/elevation-tiles-prod/skadi';
 const SRTM_GRID = 3601;
-const TERRAIN_SPACING = 30;
-const TERRAIN_BLK_SIZE_X = 28;
-const TERRAIN_BLK_SIZE_Y = 32;
-const TERRAIN_BLK_SPACE_X = 24;
-const TERRAIN_BLK_SPACE_Y = 28;
-const TERRAIN_IO_BLOCK = 2048;
-const TERRAIN_IO_DATA = 1151;   // bytes covered by the CRC (header + packed heights + trailer)
-const LOCATION_SCALING_FACTOR_F32 = Math.fround(0.011131884502145034);
-const LOCATION_SCALING_FACTOR_INV_F32 = Math.fround(89.83204953368922);
-
-function crc16xmodem(data, len) {
-    let crc = 0;
-    for (let i = 0; i < len; i++) {
-        crc ^= data[i] << 8;
-        for (let j = 0; j < 8; j++) {
-            crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
-            crc &= 0xFFFF;
-        }
-    }
-    return crc;
-}
-
-function lonScale(latDeg) {
-    return Math.max(Math.fround(Math.cos(Math.fround(latDeg * Math.PI / 180))), 0.01);
-}
-
-function addOffset(latE7, lonE7, ofsNorth, ofsEast) {
-    const dlat = Math.trunc(ofsNorth * LOCATION_SCALING_FACTOR_INV_F32);
-    const ls = lonScale((latE7 + dlat * 0.5) * 1e-7);
-    const dlng = Math.trunc((ofsEast * LOCATION_SCALING_FACTOR_INV_F32) / ls);
-    return [latE7 + dlat, lonE7 + dlng];
-}
-
-function eastBlocks(latE7, lonE7) {
-    const r = addOffset(latE7, lonE7 + 10000000, 0, 2 * TERRAIN_SPACING * TERRAIN_BLK_SIZE_Y);
-    const dlng = r[1] - lonE7;
-    const eastDist = dlng * LOCATION_SCALING_FACTOR_F32 * lonScale((latE7 + r[0]) * 0.5 * 1e-7);
-    return Math.floor(eastDist / (TERRAIN_SPACING * TERRAIN_BLK_SPACE_Y));
-}
-
 function makeHgtView(hgtData) {
     const hgtBuf = (hgtData.buffer && hgtData.buffer.byteLength === hgtData.length)
         ? hgtData.buffer : hgtData.buffer.slice(hgtData.byteOffset, hgtData.byteOffset + hgtData.byteLength);
@@ -457,91 +421,6 @@ function estimateDatSizeMB(lat) {
     return (numX * numY * TERRAIN_IO_BLOCK) / 1048576;
 }
 
-// Bit-order sanity check for the 10-bit packer, mirror-verified against the
-// firmware decoder: values 0x2AA and 0x155 must serialise to bytes AA 56 05.
-// Runs once per generation; a failure means the bit order is wrong and no
-// terrain file may be produced.
-function terrainPackerSelfTest() {
-    const vals = [0x2AA, 0x155];
-    const out = [];
-    let acc = 0, accBits = 0;
-    for (const val of vals) {
-        acc |= val << accBits;
-        accBits += 10;
-        while (accBits >= 8) { out.push(acc & 0xFF); acc >>>= 8; accBits -= 8; }
-    }
-    out.push(acc & 0xFF);   // 4 remaining bits
-    if (out[0] !== 0xAA || out[1] !== 0x56 || out[2] !== 0x05) {
-        throw new Error('Terrain 10-bit packer self-test failed (bit order) — refusing to generate');
-    }
-}
-
-// Reads packed 10-bit value i back out of the block bytes (independent decode
-// used by the per-block self-check).
-function readPacked10(u8, i) {
-    const bit = i * 10;
-    const byte = 22 + (bit >> 3);
-    const word = u8[byte] | (u8[byte + 1] << 8) | (u8[byte + 2] << 16);
-    return (word >> (bit & 7)) & 0x3FF;
-}
-
-// Packs one 2048-byte terrain block in the version-50 layout: the 896 heights
-// are stored as 10-bit offsets in 2 m steps above the block's lowest point
-// (heightBase), as one continuous little-endian bitstream. The on-disk block
-// size is unchanged — the packing saves space inside the block, not on disk.
-function packTerrainBlock(latE7, lonE7, spacing, heights, idxX, idxY, lonDeg, latDeg) {
-    const buf = new ArrayBuffer(TERRAIN_IO_BLOCK);
-    const v = new DataView(buf);
-    const u8 = new Uint8Array(buf);
-    v.setBigUint64(0, 0x00FFFFFFFFFFFFFFn, true);
-    v.setInt32(8, latE7, true);
-    v.setInt32(12, lonE7, true);
-    v.setUint16(16, 0, true);
-    v.setUint16(18, 50, true);              // format version 50 (10-bit × 2 m)
-    v.setUint16(20, spacing, true);
-
-    // The lowest point in the block is the base every height is encoded against.
-    let heightBase = heights[0];
-    for (let i = 1; i < heights.length; i++) {
-        if (heights[i] < heightBase) heightBase = heights[i];
-    }
-
-    // 896 values × 10 bits: value i occupies bits [10·i .. 10·i+9] of one
-    // little-endian bitstream (fill the accumulator from the low end, emit a
-    // byte whenever 8 bits are ready). 8960 bits = exactly 1120 bytes.
-    let acc = 0, accBits = 0, off = 22;
-    for (let i = 0; i < heights.length; i++) {
-        let step = Math.round((heights[i] - heightBase) / 2);
-        if (step < 0) step = 0;
-        if (step > 1023) step = 1023;
-        acc |= step << accBits;
-        accBits += 10;
-        while (accBits >= 8) {
-            u8[off++] = acc & 0xFF;
-            acc >>>= 8;
-            accBits -= 8;
-        }
-    }
-
-    v.setInt16(1142, heightBase, true);     // base sits AFTER the packed data
-    v.setUint16(1144, idxX, true);
-    v.setUint16(1146, idxY, true);
-    v.setInt16(1148, lonDeg, true);
-    v.setInt8(1150, latDeg);
-    const crc = crc16xmodem(u8, TERRAIN_IO_DATA);
-    v.setUint16(16, crc, true);
-
-    // Permanent self-check: independently decode the packed bytes and require
-    // every point to reconstruct within 1 m of the source height. On mismatch
-    // the encoder is broken — refuse to write bad terrain.
-    for (let i = 0; i < heights.length; i++) {
-        if (Math.abs(heightBase + 2 * readPacked10(u8, i) - heights[i]) > 1) {
-            throw new Error(`Terrain block self-check failed at point ${i} (block ${idxX}/${idxY})`);
-        }
-    }
-    return u8;
-}
-
 async function createDatFromHgt(degLat, degLon, hgtCache, progressCb) {
     terrainPackerSelfTest();
     const baseLat = degLat * 10000000;
@@ -554,21 +433,8 @@ async function createDatFromHgt(degLat, degLon, hgtCache, progressCb) {
     let blockNum = 0;
     for (let ix = 0; ix < numX; ix++) {
         for (let iy = 0; iy < numY; iy++) {
-            const blk = addOffset(baseLat, baseLon,
-                ix * TERRAIN_BLK_SPACE_X * TERRAIN_SPACING,
-                iy * TERRAIN_BLK_SPACE_Y * TERRAIN_SPACING);
-            const latE7 = blk[0];
-            const lonE7 = blk[1];
-            const heights = new Int16Array(TERRAIN_BLK_SIZE_X * TERRAIN_BLK_SIZE_Y);
-            for (let gx = 0; gx < TERRAIN_BLK_SIZE_X; gx++) {
-                for (let gy = 0; gy < TERRAIN_BLK_SIZE_Y; gy++) {
-                    const pt = addOffset(baseLat, baseLon,
-                        (ix * TERRAIN_BLK_SPACE_X + gx) * TERRAIN_SPACING,
-                        (iy * TERRAIN_BLK_SPACE_Y + gy) * TERRAIN_SPACING);
-                    heights[gx * TERRAIN_BLK_SIZE_Y + gy] = hgtElevation(hgtCache, degLat, degLon, pt[0] * 1e-7, pt[1] * 1e-7);
-                }
-            }
-            const block = packTerrainBlock(latE7, lonE7, TERRAIN_SPACING, heights, ix, iy, degLon, degLat);
+            const block = buildTerBlock(degLat, degLon, ix, iy,
+                (lat, lon) => hgtElevation(hgtCache, degLat, degLon, lat, lon));
             output.set(block, blockNum * TERRAIN_IO_BLOCK);
             blockNum++;
             if (blockNum % 200 === 0) {
@@ -920,14 +786,6 @@ async function ensureCopernicusCellData(degLat, degLon, runCache, imgCache, stat
     }
 
     return cellCache;
-}
-
-function terrainDatFilename(lat, lon) {
-    const latPrefix = lat >= 0 ? 'N' : 'S';
-    const lonPrefix = lon >= 0 ? 'E' : 'W';
-    const latStr = String(Math.abs(lat)).padStart(2, '0');
-    const lonStr = String(Math.abs(lon)).padStart(3, '0');
-    return latPrefix + latStr + lonPrefix + lonStr + '.TER';
 }
 
 function getTerrainDegreeTiles(bounds) {

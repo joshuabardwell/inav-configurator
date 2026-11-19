@@ -5,7 +5,7 @@ import Store from "electron-store";
 import path from 'path';
 import { fileURLToPath } from 'node:url';
 import started from 'electron-squirrel-startup';
-import { writeFile, readFile, appendFile, readdir, mkdir, access } from 'node:fs/promises';
+import { writeFile, readFile, appendFile, readdir, mkdir, access, open } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 
 import tcp from './tcp';
@@ -412,6 +412,40 @@ app.whenReady().then(() => {
         resolve({error: err});
       }
     });
+  });
+
+  // Reads several byte ranges of one file without loading the rest of it. Used for
+  // terrain tiles (.TER): a tile is tens of megabytes and a lookup needs a few
+  // 2 kB blocks of it. ranges is [[offset, length], ...]; the answer has one
+  // Buffer per range, shorter than asked where the file ends early.
+  ipcMain.handle('readFileRanges', async (_event, filename, ranges) => {
+    const MAX_RANGES = 20000;
+    const MAX_RANGE_LENGTH = 1024 * 1024;
+    let handle;
+    try {
+      if (!Array.isArray(ranges) || ranges.length > MAX_RANGES) {
+        throw new Error('readFileRanges: bad range list');
+      }
+      handle = await open(filename, 'r');
+      const data = [];
+      for (const range of ranges) {
+        const offset = Number(range[0]);
+        const length = Number(range[1]);
+        if (!Number.isInteger(offset) || !Number.isInteger(length) || offset < 0 || length < 0 || length > MAX_RANGE_LENGTH) {
+          throw new Error('readFileRanges: bad range');
+        }
+        const buffer = Buffer.alloc(length);
+        const { bytesRead } = await handle.read(buffer, 0, length, offset);
+        data.push(bytesRead === length ? buffer : buffer.subarray(0, bytesRead));
+      }
+      return {error: false, data: data};
+    } catch (err) {
+      return {error: err};
+    } finally {
+      if (handle) {
+        await handle.close();
+      }
+    }
   });
 
   ipcMain.handle('chmod', (_event, pathName, mode) => {

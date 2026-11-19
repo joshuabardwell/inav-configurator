@@ -86,7 +86,16 @@ import interval from './../js/intervals';
 import { Geozone, GeozoneVertex, GeozoneType, GeozoneShapes, GeozoneFenceAction }  from './../js/geozone';
 import store from './../js/store';
 import dialog from '../js/dialog';
-import elevationFetch from './../js/elevationFetch';
+import {
+    ElevationSource, elevationSourceStatus, getElevations, getTerFolder, isLocalTerrainActive, setTerFolder,
+    summariseSources
+} from './../js/elevationProvider.js';
+import {
+    AltitudeReason, MIN_AGL_DEFAULT_M, MIN_AGL_HIGHEST_M, MIN_AGL_LOWEST_M, TerrainDefaults, TerrainMode,
+    analyseClearance, clearTerrainBits, legMinM, legMinOverrideM, sampleLegs, supportsTerrainOptions,
+    terrainModeOfP3, withLegMin, withTerrainMode
+} from './../js/mission_terrain.js';
+import { queryTerrainHeights, queryTerrainStatus } from './../js/terrainMsp';
 import { fromDisplayUnits, getUnitDisplayName, getUnitMultiplier, toDisplayUnits, toFieldText } from './../js/unitConversion';
 import {
     getMission3DFlightLegs,
@@ -873,25 +882,21 @@ function readNumericField(selector, stored, unit, power = 0) {
     return stored;
 }
 
-/* One request for the whole mission instead of one per waypoint; opentopodata takes
-   locations separated by a pipe and answers in the same order. */
+/* Ground elevation under every waypoint in one go: from the terrain folder where it
+   has the tile, otherwise one online request per 100 waypoints (opentopodata takes
+   locations separated by a pipe). Null when any waypoint could not be resolved. */
 async function fetchWaypointElevations(waypoints) {
-    const elevations = [];
+    let results;
     try {
-        for (let start = 0; start < waypoints.length; start += 100) {
-            const chunk = waypoints.slice(start, start + 100);
-            const locations = chunk.map(wp => wp.getLatMap() + ',' + wp.getLonMap()).join('|');
-            const response = await elevationFetch('https://api.opentopodata.org/v1/aster30m?locations=' + locations);
-            if (!response.ok) return null;
-            const answer = await response.json();
-            if (answer.status != 'OK' || !answer.results || answer.results.length != chunk.length) return null;
-            answer.results.forEach(result => elevations.push(result.elevation == null ? null : result.elevation));
-        }
+        results = await getElevations(
+            waypoints.map(wp => ({lat: Number(wp.getLatMap()), lon: Number(wp.getLonMap())})),
+            {onlineLimit: Math.max(100, waypoints.length)});
     } catch (error) {
         // offline or the service unreachable - same handled failure as a bad answer
         console.warn('elevation lookup failed:', error.message);
         return null;
     }
+    const elevations = results.map(result => result.elevation);
     return elevations.includes(null) ? null : elevations;
 }
 let mission3DViewer = null;
@@ -997,6 +1002,19 @@ missionControlTab.initialize = function (callback) {
         approachLengthCm: null,
         speedFromFc: false,
         turnSmoothing: TurnSmoothing.OFF
+    };
+    // Terrain clearance analysis. The default minimum height above ground is the
+    // flight controller's terrain_nav_min_agl when one is connected and has that
+    // setting; offline it is the copy kept with the planner settings.
+    let terrain = {
+        globalMinM: MIN_AGL_DEFAULT_M,
+        minFromFc: false,
+        params: {},         // TerrainDefaults overrides read from the flight controller
+        analysis: null,     // result of the last run, see runTerrainAnalysis()
+        layer: null,
+        sequence: 0,
+        timer: null,
+        pending: null
     };
     let googleLocationRequestStarted = false;
     let conditionsFetched = false;
@@ -1436,6 +1454,41 @@ missionControlTab.initialize = function (callback) {
                         simulation.speedFromFc = true;
                     }
                 }).catch(() => {}).then(() => callback());
+            },
+            // Terrain settings. A firmware without the terrain feature answers none of
+            // these, and the planner keeps its stored minimum and the firmware defaults.
+            function (callback) {
+                mspHelper.getSetting("terrain_nav_min_agl").then((data) => {
+                    const centimetres = data ? readNumericSetting(data, 0) : 0;
+                    if (centimetres > 0) {
+                        terrain.globalMinM = centimetres / 100;
+                        terrain.minFromFc = true;
+                    }
+                }).catch(() => {}).then(() => callback());
+            },
+            function (callback) {
+                mspHelper.getSetting("terrain_nav_lookahead").then((data) => {
+                    if (data) terrain.params.lookaheadM = readNumericSetting(data, TerrainDefaults.lookaheadM);
+                }).catch(() => {}).then(() => callback());
+            },
+            function (callback) {
+                mspHelper.getSetting("nav_fw_auto_climb_rate").then((data) => {
+                    const centimetresPerSecond = data ? readNumericSetting(data, 0) : 0;
+                    if (centimetresPerSecond > 0) terrain.params.climbRateMs = centimetresPerSecond / 100;
+                }).catch(() => {}).then(() => callback());
+            },
+            function (callback) {
+                mspHelper.getSetting("nav_fw_alt_control_response").then((data) => {
+                    const response = data ? readNumericSetting(data, 0) : 0;
+                    if (response > 0) terrain.params.altResponse = response / 100;
+                }).catch(() => {}).then(() => callback());
+            },
+            // How many terrain blocks the board caches limits how far its look-ahead
+            // reaches. Only this fork's firmware answers; stock keeps the default.
+            function (callback) {
+                queryTerrainStatus().then((status) => {
+                    if (status && status.cacheBlocks > 0) terrain.params.cacheBlocks = status.cacheBlocks;
+                }).catch(() => {}).then(() => callback());
             }
         ]);
         loadChainer.setExitPoint(function () {
@@ -1509,6 +1562,7 @@ function iconKey(filename) {
 
        
             loadSettings();
+            loadTerrainFolder();
             // let the dom load finish, avoiding the resizing of the map
             setTimeout(initMap, 200);
             // Set initial button visibility based on mission state
@@ -2530,10 +2584,419 @@ function iconKey(filename) {
         $('#MPdefaultFwApproachAltUnit').text(missionUnitLabel(MISSION_UNIT_DIST));
         $('#MPdefaultLandAltUnit').text(missionUnitLabel(MISSION_UNIT_DIST));
         updateDefaultUnitHints();
+        loadDefaultMinAgl();
     }
 
     function closeSettingsPanel() {
         $('#missionPlannerSettings').hide();
+    }
+
+    /////////////////////////////////////////////
+    //
+    // Terrain folder: local .TER tiles as the elevation source
+    //
+    /////////////////////////////////////////////
+    const TERRAIN_FOLDER_KEY = 'missionPlannerTerrainFolder';
+
+    /* The folder is kept apart from the other planner settings: it takes effect when
+       it is chosen, not when the settings box is saved. Until one has been chosen
+       here, the folder the Map Generator last wrote terrain files to is used. */
+    function loadTerrainFolder() {
+        if (typeof globalThis.electronAPI?.readFileRanges !== 'function') {
+            setTerFolder(null);
+            return;     // this build cannot read local files; the row stays hidden
+        }
+        let folder = store.get(TERRAIN_FOLDER_KEY, null);
+        if (folder === null) {
+            folder = store.get('mapgen_sd_path', null) || '';
+        }
+        setTerFolder(folder || null);
+        $('#MPterrainFolderRow').show();
+        refreshTerrainFolderDisplay();
+    }
+
+    async function refreshTerrainFolderDisplay() {
+        const folder = getTerFolder();
+        const $path = $('#MPterrainFolderPath');
+        const $status = $('#MPterrainFolderStatus');
+        $('#MPterrainFolderClear').toggle(!!folder);
+
+        if (!folder) {
+            $path.text(i18n.getMessage('missionTerrainFolderNone'));
+            $status.text('');
+            return;
+        }
+        $path.text(folder);
+        let reachable = false;
+        try {
+            reachable = await globalThis.electronAPI.pathExists(folder);
+        } catch (error) {
+            reachable = false;
+        }
+        if (getTerFolder() !== folder) return;   // changed while checking
+        if (!reachable) {
+            $status.text(i18n.getMessage('missionTerrainFolderNotFound'));
+            return;
+        }
+        const missing = elevationSourceStatus().tilesMissing;
+        $status.text(missing.length ? i18n.getMessage('missionTerrainFolderMissingTiles', [missing.join(', ')]) : '');
+    }
+
+    /* Everything on screen that was computed from the old source is looked up again. */
+    function applyTerrainFolder(folder) {
+        store.set(TERRAIN_FOLDER_KEY, folder || '');
+        setTerFolder(folder || null);
+        refreshTerrainFolderDisplay();
+
+        invalidateHomeElevation();
+        resolveHomeElevationCm().then(() => {
+            if (selectedMarker) {
+                refreshGroundClearanceDisplay();
+            }
+            plotElevation();
+        });
+    }
+
+    /* Says where the elevation shown for a waypoint came from. */
+    function showElevationSource(wp) {
+        const source = wp && typeof wp.getElevationSource === 'function' ? wp.getElevationSource() : 'none';
+        const $label = $('#elevationSourceAtWP');
+        $label.toggleClass('fromTerrainFile', source === ElevationSource.TER);
+        if (source === ElevationSource.TER) {
+            $label.text(i18n.getMessage('missionElevationSourceTer'));
+        } else if (source === ElevationSource.ONLINE || source === ElevationSource.ONLINE_COARSE) {
+            $label.text(i18n.getMessage('missionElevationSourceOnline'));
+        } else {
+            $label.text('');
+        }
+        if ($('#missionPlannerSettings').is(':visible')) {
+            refreshTerrainFolderDisplay();
+        }
+    }
+
+    /////////////////////////////////////////////
+    //
+    // Terrain clearance: minimum height above ground, leg checks, map warnings
+    //
+    /////////////////////////////////////////////
+
+    /* Minimum height above ground for the leg flown to a waypoint: its own value when it
+       has one, otherwise the default. A landing has none. */
+    function minAglFor(wp) {
+        if (!wp || wp.getAction() == MWNP.WPTYPE.LAND) return -Infinity;
+        return legMinM(wp.getAction(), wp.getP3(), terrain.globalMinM);
+    }
+
+    function terrainParams() {
+        return {...terrain.params, speedMs: simulation.speedMs};
+    }
+
+    /* The offline copy of the default minimum lives with the planner settings. A
+       connected flight controller that has terrain_nav_min_agl overrides it. */
+    function loadDefaultMinAgl() {
+        if (!terrain.minFromFc) {
+            const stored = Number(settings.minClearanceCm) / 100;
+            terrain.globalMinM = stored >= MIN_AGL_LOWEST_M && stored <= MIN_AGL_HIGHEST_M ? stored : MIN_AGL_DEFAULT_M;
+        }
+        $('#MPdefaultMinAgl').val(String(terrain.globalMinM));
+        $('#MPdefaultMinAglSource').text(i18n.getMessage(terrain.minFromFc ? 'missionDefaultMinAglFromFc' : 'missionDefaultMinAglStored'));
+    }
+
+    /* Takes the default minimum typed in the settings box. Written to the flight
+       controller when it has the setting, and always kept with the planner settings. */
+    function saveDefaultMinAgl() {
+        const typed = Number(String($('#MPdefaultMinAgl').val()).trim());
+        if (!Number.isFinite(typed) || typed < MIN_AGL_LOWEST_M || typed > MIN_AGL_HIGHEST_M) {
+            GUI.log(i18n.getMessage('missionDefaultMinAglRange', [String(MIN_AGL_LOWEST_M), String(MIN_AGL_HIGHEST_M)]));
+            $('#MPdefaultMinAgl').val(String(terrain.globalMinM));
+            return;
+        }
+        const metres = Math.round(typed);
+        const changed = metres !== terrain.globalMinM;
+        terrain.globalMinM = metres;
+        settings.minClearanceCm = metres * 100;
+        saveSettings();
+        $('#MPdefaultMinAgl').val(String(metres));
+
+        if (changed && terrain.minFromFc && CONFIGURATOR.connectionValid) {
+            // Same pattern as the multi-mission index: the log line only appears once
+            // the setting was accepted and the EEPROM write was answered.
+            mspHelper.setSetting("terrain_nav_min_agl", metres * 100, function () {
+                MSP.send_message(MSPCodes.MSP_EEPROM_WRITE, false, false, function () {
+                    GUI.log(i18n.getMessage('missionDefaultMinAglSaved', [String(metres)]));
+                });
+            });
+        }
+        if (changed) {
+            syncTerrainControls(selectedMarker);
+            refreshGroundClearanceDisplay(Number($('#elevationValueAtWP').text()));
+            scheduleTerrainAnalysis();
+            plotElevation();
+        }
+    }
+
+    /* The waypoints in the order they are flown, each with its altitude above sea
+       level (null for a relative altitude while the home elevation is not known). */
+    async function buildTerrainRoute() {
+        if (mission.isEmpty() || disableMarkerEdit || !singleMissionActive()) return null;
+        const flown = mission.getPoint2Measure(true)[5] || [];
+        if (!flown.length) return null;
+
+        const needsHome = flown.some(wp => !missionControlTab.isBitSet(wp.getP3(), MWNP.P3.ALT_TYPE));
+        if (needsHome && homeMarkers.length && HOME.getAlt() == "N/A") {
+            await resolveHomeElevationCm();
+        }
+        const homeM = homeMarkers.length && HOME.getAlt() != "N/A" ? Number(HOME.getAlt()) : null;
+
+        return flown.map(wp => {
+            const altM = Number(wp.getAlt()) / 100;
+            const absolute = missionControlTab.isBitSet(wp.getP3(), MWNP.P3.ALT_TYPE);
+            return {
+                lat: Number(wp.getLatMap()),
+                lon: Number(wp.getLonMap()),
+                altAmslM: absolute ? altM : (homeM === null ? null : altM + homeM),
+                action: wp.getAction(),
+                p3: Number(wp.getP3()),
+                number: wp.getNumber(),
+                label: wp.getLayerNumber() + 1
+            };
+        });
+    }
+
+    /* Edits arrive in bursts (a drag repaints on every move), so the analysis waits
+       until they pause. */
+    function scheduleTerrainAnalysis() {
+        clearTimeout(terrain.timer);
+        terrain.timer = setTimeout(() => { runTerrainAnalysis(); }, 250);
+    }
+
+    /* Samples every leg, looks the ground up under each sample and works out the
+       predicted altitude and clearance. The result feeds the map warnings, the leg
+       line in the edit panel and the altitude chart. */
+    async function runTerrainAnalysis() {
+        clearTimeout(terrain.timer);
+        const sequence = ++terrain.sequence;
+        let analysis = null;
+        try {
+            const route = await buildTerrainRoute();
+            if (route) {
+                const sampling = sampleLegs(route);
+                const results = await getElevations(sampling.samples);
+                const terrainM = results.map(result => result.elevation);
+                analysis = {
+                    ...analyseClearance({route, sampling, terrainM, globalMinM: terrain.globalMinM, params: terrainParams()}),
+                    route,
+                    sampling,
+                    terrainM,
+                    sources: summariseSources(results)
+                };
+            }
+        } catch (error) {
+            console.warn('terrain analysis failed:', error.message);
+        }
+        if (sequence !== terrain.sequence) return terrain.analysis;   // a newer run owns the screen
+        terrain.analysis = analysis;
+        paintTerrainWarnings();
+        showLegClearance();
+        return analysis;
+    }
+
+    const TERRAIN_BELOW_COLOR = '#e60000';
+    const TERRAIN_FALLBACK_COLOR = '#ff9900';
+
+    // Red warning triangle shown up and to the right of a waypoint pin.
+    function terrainBadgeStyle() {
+        const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">'
+            + '<path d="M12 2 L22.5 21 L1.5 21 Z" fill="' + TERRAIN_BELOW_COLOR + '" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/>'
+            + '<rect x="11" y="8" width="2" height="7.5" fill="#fff"/>'
+            + '<rect x="11" y="16.6" width="2" height="2" fill="#fff"/>'
+            + '</svg>';
+        return new Style({
+            image: new Icon({
+                src: 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg),
+                scale: 1,
+                displacement: [25, 44]
+            })
+        });
+    }
+
+    /* Redraws the warning overlay: red where the predicted path is closer to the
+       ground than the leg's minimum, dashed amber where only the terrain mode keeps a
+       leg clear (stock firmware, or lost terrain data, would fly it low), and a badge
+       on every waypoint that is low itself or whose leg is. */
+    function paintTerrainWarnings() {
+        if (terrain.layer && map) {
+            map.removeLayer(terrain.layer);
+        }
+        terrain.layer = null;
+        const analysis = terrain.analysis;
+        if (!analysis || !map) return;
+
+        const samples = analysis.sampling.samples;
+        const features = [];
+        const addLine = (range, style) => {
+            const coordinates = [];
+            for (let k = range.fromSample; k <= range.toSample; k++) {
+                coordinates.push(fromLonLat([samples[k].lon, samples[k].lat]));
+            }
+            if (coordinates.length < 2) return;
+            const feature = new Feature({geometry: new LineString(coordinates)});
+            feature.setStyle(style);
+            features.push(feature);
+        };
+
+        const fallbackStyle = new Style({
+            stroke: new Stroke({color: TERRAIN_FALLBACK_COLOR, width: 5, lineDash: [8, 8]})
+        });
+        const belowStyle = [
+            new Style({stroke: new Stroke({color: '#ffffff', width: 9})}),
+            new Style({stroke: new Stroke({color: TERRAIN_BELOW_COLOR, width: 6})})
+        ];
+        analysis.fallbackRanges.forEach(range => addLine(range, fallbackStyle));
+        analysis.belowRanges.forEach(range => addLine(range, belowStyle));
+
+        const badged = new Set();
+        analysis.waypoints.forEach((entry, i) => {
+            const point = analysis.route[i];
+            if (!entry.flagged || badged.has(point.number)) return;
+            badged.add(point.number);
+            const feature = new Feature({geometry: new Point(fromLonLat([point.lon, point.lat]))});
+            feature.setStyle(terrainBadgeStyle());
+            features.push(feature);
+        });
+
+        if (!features.length) return;
+        terrain.layer = new VectorLayer({source: new VectorSource({features}), zIndex: 120});
+        // Same rule as the simulated track: an overlay must never be picked up as a
+        // marker to drag or a line to insert a waypoint into.
+        terrain.layer.set('no_interaction', true);
+        map.addLayer(terrain.layer);
+    }
+
+    /* One line in the edit panel about the leg flown to the selected waypoint. */
+    function showLegClearance() {
+        const $row = $('#pointLegClearanceClass');
+        const analysis = terrain.analysis;
+        const index = analysis && selectedMarker
+            ? analysis.route.findIndex((point, i) => i > 0 && point.number === selectedMarker.getNumber())
+            : -1;
+        if (index < 1) {
+            $row.hide();
+            return;
+        }
+        const leg = analysis.legs[index];
+        const $text = $('#pointLegClearance');
+        if (leg.lowestClearanceM === null) {
+            $text.text(i18n.getMessage('missionLegClearanceUnknown')).css('color', '');
+        } else {
+            const span = analysis.sampling.legs[index];
+            const beforeM = span.lengthM - (analysis.sampling.samples[leg.lowestAtSample].distM - span.startDistM);
+            $text.text(i18n.getMessage('missionLegClearance',
+                [String(Math.round(leg.lowestClearanceM)), String(Math.max(0, Math.round(beforeM)))]));
+            $text.css('color', leg.below ? '#FF0000' : '');
+        }
+        $row.show();
+    }
+
+    /* After a mission was sent: does the flight controller have the terrain its Floor
+       and Follow legs rely on? Asks this fork's firmware for the height at both ends of
+       every such leg and compares with the planner's own terrain files. A check, not
+       a gate: the mission is already on the flight controller, the log and the
+       dialog say what is wrong. */
+    async function checkTerrainOnFlightController(analysis) {
+        if (!analysis || !CONFIGURATOR.connectionValid) return;
+        const terrainLegs = analysis.legs.filter(leg => leg && leg.mode !== TerrainMode.OFF);
+        if (!terrainLegs.length) return;
+
+        const problems = [];
+        let checked = 0;
+        const status = await queryTerrainStatus();
+        if (!status) {
+            problems.push(i18n.getMessage('missionTerrainFcStock'));
+        } else if (!status.enabled) {
+            problems.push(i18n.getMessage('missionTerrainFcDisabled'));
+        } else if (status.ioFailure) {
+            problems.push(i18n.getMessage('missionTerrainFcCardFailure'));
+        } else if (status.armed) {
+            problems.push(i18n.getMessage('missionTerrainFcArmed'));
+        } else {
+            const wanted = new Map();   // waypoint label -> { lat, lon, plannerM }
+            terrainLegs.forEach(leg => {
+                [leg.index - 1, leg.index].forEach(i => {
+                    const point = analysis.route[i];
+                    const sample = i === 0 ? 0 : analysis.sampling.legs[i].lastSample;
+                    if (!wanted.has(point.label)) {
+                        wanted.set(point.label, {lat: point.lat, lon: point.lon, plannerM: analysis.terrainM[sample]});
+                    }
+                });
+            });
+            const labels = [...wanted.keys()];
+            const result = await queryTerrainHeights(labels.map(label => wanted.get(label)));
+            const missing = [];
+            const differing = [];
+            labels.forEach((label, n) => {
+                const onCard = result ? result.heights[n] : null;
+                const plannerM = wanted.get(label).plannerM;
+                if (onCard === null) {
+                    missing.push(label);
+                } else if (plannerM !== null && Math.abs(onCard - plannerM) > 5) {
+                    differing.push(label);
+                } else {
+                    checked++;
+                }
+            });
+            if (missing.length) problems.push(i18n.getMessage('missionTerrainFcMissing', [missing.join(', ')]));
+            if (differing.length) problems.push(i18n.getMessage('missionTerrainFcDiffers', [differing.join(', ')]));
+        }
+
+        if (problems.length) {
+            problems.forEach(text => GUI.log(text));
+            dialog.alert(problems.join('\n\n'));
+        } else {
+            GUI.log(i18n.getMessage('missionTerrainFcOk', [String(checked)]));
+        }
+    }
+
+    /* Shows the selected waypoint's terrain options. Follow turns the ground distance
+       into the number that is typed: the altitude is derived from it and locked. */
+    function syncTerrainControls(wp) {
+        const supported = !!wp && supportsTerrainOptions(wp.getAction());
+        $('#pointMinAglClass, #pointTerrainModeClass').toggle(supported);
+        if (!supported) {
+            $('#pointAlt').prop('readonly', false);
+            return;
+        }
+        const own = legMinOverrideM(wp.getAction(), wp.getP3());
+        $('#pointMinAgl').val(String(own === null ? terrain.globalMinM : own));
+        $('#pointMinAglDefault').toggle(own === null);
+        $('#pointMinAglReset').toggle(own !== null);
+
+        const mode = terrainModeOfP3(wp.getAction(), wp.getP3());
+        $('#pointTerrainMode').val(String(mode));
+        $('#pointAlt').prop('readonly', mode === TerrainMode.FOLLOW);
+
+        let hint = '';
+        if (mode === TerrainMode.FOLLOW) {
+            hint = i18n.getMessage('missionTerrainHintFollow');
+            if (!missionControlTab.isBitSet(wp.getP3(), MWNP.P3.ALT_TYPE)) {
+                hint += ' ' + i18n.getMessage('missionTerrainHintFollowRelative');
+            }
+        }
+        if (mode !== TerrainMode.OFF) {
+            hint += (hint ? ' ' : '') + i18n.getMessage('missionTerrainHintStock');
+        }
+        $('#pointTerrainHint').text(hint);
+    }
+
+    /* Writes a changed P3 of the selected waypoint and refreshes what depends on it. */
+    function commitTerrainOptions(p3) {
+        selectedMarker.setP3(p3);
+        mission.updateWaypoint(selectedMarker);
+        mission.update(singleMissionActive());
+        syncTerrainControls(selectedMarker);
+        refreshGroundClearanceDisplay(Number($('#elevationValueAtWP').text()));
+        redrawLayer();
+        plotElevation();
     }
 
     /////////////////////////////////////////////
@@ -3803,6 +4266,7 @@ function iconKey(filename) {
 
         repaintSimulation();
         updateMission3D();
+        scheduleTerrainAnalysis();
     }
 
     function paintLine(pos1, pos2, pos2ID, color='#1497f1', lineDash=0, lineText="", selection=true, arrow=false) {
@@ -4126,6 +4590,7 @@ function iconKey(filename) {
             // An emptied mission must empty the panel too, or its figures keep
             // describing a track that is no longer there.
             repaintSimulation();
+            scheduleTerrainAnalysis();
         }
 
         renderWaypointSelect();
@@ -4171,6 +4636,8 @@ function iconKey(filename) {
         changeSwitch($('#pointP3UserAction2'), missionControlTab.isBitSet(P3Value, MWNP.P3.USER_ACTION_2));
         changeSwitch($('#pointP3UserAction3'), missionControlTab.isBitSet(P3Value, MWNP.P3.USER_ACTION_3));
         changeSwitch($('#pointP3UserAction4'), missionControlTab.isBitSet(P3Value, MWNP.P3.USER_ACTION_4));
+        syncTerrainControls(selectedMarker);
+        showLegClearance();
 
 
         if (selectedMarker.getAction() == MWNP.WPTYPE.LAND) {
@@ -4188,6 +4655,7 @@ function iconKey(filename) {
                 if (selectedMarker !== wp) return;
 
                 $('#elevationValueAtWP').text(elevationAtWP);
+                showElevationSource(wp);
                 rememberTerrain(wp, elevationAtWP);
                 const returnAltitude = checkAltElevSanity(false, wp.getAlt(), elevationAtWP, P3Value);
                 wp.setAlt(returnAltitude);
@@ -4279,6 +4747,8 @@ function iconKey(filename) {
     async function refreshGroundClearanceDisplay(knownElevation) {
         const wp = selectedMarker;
         if (!wp) return;
+        // The terrain options sit next to the clearance and change with the same edits.
+        syncTerrainControls(wp);
 
         // The terrain height is already on screen for the selected waypoint, so a caller
         // that only needs the reading recomputed can hand it over and skip the lookup.
@@ -4294,6 +4764,7 @@ function iconKey(filename) {
         }
 
         $('#elevationValueAtWP').text(elevation);
+        showElevationSource(wp);
         rememberTerrain(wp, elevation);
 
         let clearance = 'NO HOME';
@@ -4302,8 +4773,9 @@ function iconKey(filename) {
         } else if (homeMarkers.length && HOME.getAlt() != "N/A") {
             clearance = wp.getAlt() / 100 + (Number(HOME.getAlt()) - elevation);
         }
+        // Red when the waypoint is closer to the ground than the minimum for its leg.
         document.getElementById('groundClearanceAtWP').style.color =
-            (typeof clearance === 'number' && clearance < settings.alt / 100) ? "#FF0000" : "#303030";
+            (typeof clearance === 'number' && clearance < minAglFor(wp)) ? "#FF0000" : "#303030";
         $('#groundClearanceValueAtWP').val(clearance);
     }
 
@@ -5916,10 +6388,65 @@ function iconKey(filename) {
                 }
                 $('#pointP1').val(parameterToDisplay(selectedMarker.getAction(), 'parameter1', selectedMarker.getP1()));
                 $('#pointP2').val(parameterToDisplay(selectedMarker.getAction(), 'parameter2', selectedMarker.getP2()));
+                // Terrain options only mean something on a waypoint the aircraft flies to.
+                if (!supportsTerrainOptions(selectedMarker.getAction())) {
+                    selectedMarker.setP3(clearTerrainBits(selectedMarker.getP3()));
+                }
+                syncTerrainControls(selectedMarker);
                 mission.updateWaypoint(selectedMarker);
                 mission.update(singleMissionActive());
                 redrawLayer();
             }
+        });
+
+        // A waypoint's own minimum height above ground, for the leg flown to it.
+        $('#pointMinAgl').on('change', function () {
+            if (!selectedMarker || disableMarkerEdit || !supportsTerrainOptions(selectedMarker.getAction())) {
+                syncTerrainControls(selectedMarker);
+                return;
+            }
+            const typed = Number(String($(this).val()).trim());
+            if (!Number.isFinite(typed) || typed < MIN_AGL_LOWEST_M || typed > MIN_AGL_HIGHEST_M) {
+                GUI.log(i18n.getMessage('missionDefaultMinAglRange', [String(MIN_AGL_LOWEST_M), String(MIN_AGL_HIGHEST_M)]));
+                pointEditRefused = true;
+                syncTerrainControls(selectedMarker);
+                return;
+            }
+            commitTerrainOptions(withLegMin(selectedMarker.getP3(), typed));
+        });
+
+        $('#pointMinAglReset').on('click', function (event) {
+            event.preventDefault();
+            if (!selectedMarker || disableMarkerEdit) return;
+            commitTerrainOptions(withLegMin(selectedMarker.getP3(), null));
+        });
+
+        // Off / Floor / Follow for the leg flown to the waypoint.
+        $('#pointTerrainMode').on('change', function () {
+            if (!selectedMarker || disableMarkerEdit || !supportsTerrainOptions(selectedMarker.getAction())) {
+                syncTerrainControls(selectedMarker);
+                return;
+            }
+            const mode = Number($(this).val());
+            if (mode === TerrainMode.FOLLOW) {
+                // Follow stores an altitude worked out from the ground height here, so that
+                // height has to come from the same data the flight controller uses.
+                const absolute = missionControlTab.isBitSet(selectedMarker.getP3(), MWNP.P3.ALT_TYPE);
+                let refusal = null;
+                if (selectedMarker.getElevationSource() !== ElevationSource.TER) {
+                    refusal = 'missionTerrainFollowNeedsTerrain';
+                } else if (!absolute && !(homeMarkers.length && HOME.getAlt() != "N/A")) {
+                    refusal = 'missionTerrainFollowNeedsHome';
+                }
+                if (refusal) {
+                    GUI.log(i18n.getMessage(refusal));
+                    pointEditRefused = true;
+                    syncTerrainControls(selectedMarker);
+                    $('#pointTerrainHint').text(i18n.getMessage(refusal));
+                    return;
+                }
+            }
+            commitTerrainOptions(withTerrainMode(selectedMarker.getP3(), mode));
         });
 
         $('#pointLat').on('change', function (event) {
@@ -6042,6 +6569,7 @@ function iconKey(filename) {
                     if (selectedMarker !== wp) return;
 
                     $('#elevationValueAtWP').text(elevationAtWP);
+                    showElevationSource(wp);
                     rememberTerrain(wp, elevationAtWP);
 
                     if (P3Value != selectedMarker.getP3()) {
@@ -7407,6 +7935,8 @@ function iconKey(filename) {
             changeSwitch($('#pointP3UserAction2'), TABS.mission_control.isBitSet(P3Value, MWNP.P3.USER_ACTION_2));
             changeSwitch($('#pointP3UserAction3'), TABS.mission_control.isBitSet(P3Value, MWNP.P3.USER_ACTION_3));
             changeSwitch($('#pointP3UserAction4'), TABS.mission_control.isBitSet(P3Value, MWNP.P3.USER_ACTION_4));
+            syncTerrainControls(selectedMarker);
+            showLegClearance();
 
             if (selectedMarker.getAction() == MWNP.WPTYPE.LAND) {
                 $('#wpFwLanding').fadeIn(300);
@@ -7417,6 +7947,7 @@ function iconKey(filename) {
             (async () => {
                 const elevationAtWP = await selectedMarker.getElevation(globalSettings);
                 $('#elevationValueAtWP').text(elevationAtWP);
+                showElevationSource(selectedMarker);
                 const returnAltitude = checkAltElevSanity(false, selectedMarker.getAlt(), elevationAtWP, P3Value);
                 selectedMarker.setAlt(returnAltitude);
                 plotElevation();
@@ -7650,6 +8181,7 @@ function iconKey(filename) {
             settings.fwLandAlt = readNumericField('#MPdefaultLandAlt', settings.fwLandAlt, MISSION_UNIT_DIST, 2);
 
             saveSettings();
+            saveDefaultMinAgl();
 
             if (settings.safeRadiusSH != oldSafeRadiusSH  && $('#showHideSafehomeButton').is(":visible")) {
                 cleanSafehomeLayers();
@@ -7670,6 +8202,26 @@ function iconKey(filename) {
             loadSettings();
             refreshSeaLevelSwitch();
             closeSettingsPanel();
+        });
+
+        $('#MPterrainFolderChoose').on('click', async function (event) {
+            event.preventDefault();
+            const options = {
+                title: i18n.getMessage('missionTerrainFolderDialogTitle'),
+                properties: ['openDirectory']
+            };
+            if (getTerFolder()) {
+                options.defaultPath = getTerFolder();
+            }
+            const result = await globalThis.electronAPI.showOpenDialog(options);
+            if (!result.canceled && result.filePaths && result.filePaths.length > 0) {
+                applyTerrainFolder(result.filePaths[0]);
+            }
+        });
+
+        $('#MPterrainFolderClear').on('click', function (event) {
+            event.preventDefault();
+            applyTerrainFolder(null);
         });
 
         // Editing a value clears the tick of the previous save
@@ -7725,7 +8277,8 @@ function iconKey(filename) {
         // it, and the save button commits whatever is still being typed. These handlers
         // sit after the field handlers above, so the tick appears once the value is in.
         const pointEditorFields = '#pointType, #pointLat, #pointLon, #pointAlt, #pointP1, #pointP2,'
-            + ' #groundClearanceValueAtWP, #pointP3Alt, #pointP3UserAction1, #pointP3UserAction2,'
+            + ' #groundClearanceValueAtWP, #pointMinAgl, #pointTerrainMode,'
+            + ' #pointP3Alt, #pointP3UserAction1, #pointP3UserAction2,'
             + ' #pointP3UserAction3, #pointP3UserAction4, #wpApproachAlt, #wpLandAlt,'
             + ' #wpApproachDirection, #wpLandHeading1, #wpLandHeading1Excl, #wpLandHeading2, #wpLandHeading2Excl';
         $(pointEditorFields).on('input', function () {
@@ -8129,6 +8682,7 @@ function iconKey(filename) {
     }
 
     function sendWaypointsToFC(saveEeprom) {
+        const analysisAtSend = terrain.analysis;
         FC.MISSION_PLANNER.reinit();
         FC.MISSION_PLANNER.copy(mission);
         FC.MISSION_PLANNER.update(false, true, true);
@@ -8156,6 +8710,8 @@ function iconKey(filename) {
                 refreshLayers();
                 $('#MPeditPoint').fadeOut(300);
                 updateLocationButtonsVisibility();
+                checkTerrainOnFlightController(analysisAtSend)
+                    .catch(error => console.warn('terrain check on the flight controller failed:', error));
             }
         ]);
         saveChainer.execute();
@@ -8231,7 +8787,9 @@ function iconKey(filename) {
         }
         $('#pointAlt').val(altitudeToDisplay(altitude));
         $('#altitudeInMeters').text(altitudeReadout(altitude));
-        document.getElementById('groundClearanceAtWP').style.color = groundClearance < (settings.alt / 100) ? "#FF0000" : "#303030";
+        // Red when the waypoint is closer to the ground than the minimum for its leg.
+        document.getElementById('groundClearanceAtWP').style.color =
+            (typeof groundClearance === 'number' && groundClearance < minAglFor(selectedMarker)) ? "#FF0000" : "#303030";
         $('#groundClearanceValueAtWP').val(groundClearance);
 
         return altitude;
@@ -8239,6 +8797,153 @@ function iconKey(filename) {
 
     // Track elevation chart update sequence to prevent race conditions
     let elevationUpdateSequence = 0;
+    // 'terrain' while the chart shows the terrain analysis, 'legacy' for the older
+    // two-line chart. The two use different datasets, so the instance is not shared.
+    let elevationChartKind = 'legacy';
+
+    const REASON_COLOR = {
+        [AltitudeReason.PLANNED]: '#1497f1',
+        [AltitudeReason.FOLLOW]: '#28a745',
+        [AltitudeReason.TERRAIN_CLIMB]: '#c026d3',
+        [AltitudeReason.BELOW_MIN]: '#e60000',
+        [AltitudeReason.NO_DATA]: '#888888',
+        [AltitudeReason.UNKNOWN]: '#888888'
+    };
+
+    function terrainSourceText(sources) {
+        switch (sources.overall) {
+            case ElevationSource.TER: return i18n.getMessage('missionTerrainChartSourceTer');
+            case 'mixed': return i18n.getMessage('missionTerrainChartSourceMixed');
+            case ElevationSource.ONLINE_COARSE: return i18n.getMessage('missionTerrainChartSourceCoarse');
+            case ElevationSource.ONLINE: return i18n.getMessage('missionTerrainChartSourceOnline');
+            default: return '';
+        }
+    }
+
+    /* The altitude chart drawn from the terrain analysis: the ground, the ground plus
+       each leg's minimum, the waypoint altitudes, and the altitude the aircraft is
+       predicted to fly, coloured by what it is doing at that point. */
+    function drawTerrainChart(analysis, chartTitle) {
+        const ctx = $("#elevationChart").get(0);
+        if (!ctx || ctx.tagName !== 'CANVAS') {
+            console.error('elevationChart canvas element not found');
+            return;
+        }
+
+        const samples = analysis.sampling.samples;
+        const legs = analysis.sampling.legs;
+        const series = (valueAt) => samples.map((sample, k) => ({x: sample.distM, y: valueAt(k)}));
+
+        const terrainData = series(k => analysis.terrainM[k]);
+        const minimumData = series(k => (analysis.terrainM[k] !== null && Number.isFinite(analysis.minM[k])
+            ? analysis.terrainM[k] + analysis.minM[k] : null));
+        const predictedData = series(k => analysis.altM[k]);
+        const waypointData = analysis.route
+            .map((point, i) => ({x: i === 0 ? 0 : legs[i].startDistM + legs[i].lengthM, y: point.altAmslM}))
+            .filter(point => point.y !== null);
+        const usesTerrainModes = analysis.legs.some(leg => leg && leg.mode !== TerrainMode.OFF);
+
+        const reasons = new Set(analysis.reason);
+        const reasonAt = (context) => REASON_COLOR[analysis.reason[context.p1DataIndex]] || REASON_COLOR[AltitudeReason.PLANNED];
+        // An empty dataset per colour in use, so the legend explains the line.
+        const legendEntry = (reason, key) => ({
+            label: i18n.getMessage(key), data: [], borderColor: REASON_COLOR[reason],
+            backgroundColor: REASON_COLOR[reason], borderWidth: 3, pointRadius: 0
+        });
+
+        const datasets = [
+            {
+                label: i18n.getMessage('missionTerrainChartTerrain'),
+                data: terrainData,
+                borderColor: '#ff7f0e',
+                backgroundColor: 'rgba(255, 127, 14, 0.2)',
+                borderWidth: 2,
+                fill: true,
+                pointRadius: 0,
+            },
+            {
+                label: i18n.getMessage('missionTerrainChartMinimum'),
+                data: minimumData,
+                borderColor: '#e60000',
+                backgroundColor: 'rgba(0, 0, 0, 0)',
+                borderWidth: 1,
+                borderDash: [6, 4],
+                pointRadius: 0,
+            },
+            {
+                label: i18n.getMessage('missionTerrainChartPredicted'),
+                data: predictedData,
+                borderColor: REASON_COLOR[AltitudeReason.PLANNED],
+                backgroundColor: 'rgba(0, 0, 0, 0)',
+                borderWidth: 3,
+                pointRadius: 0,
+                segment: {borderColor: reasonAt},
+            },
+            {
+                label: i18n.getMessage('missionTerrainChartWaypoints'),
+                data: waypointData,
+                showLine: false,
+                borderColor: '#1f77b4',
+                pointRadius: 5,
+                pointBackgroundColor: '#1f77b4',
+            }
+        ];
+        if (usesTerrainModes) {
+            datasets.push({
+                label: i18n.getMessage('missionTerrainChartStock'),
+                data: series(k => analysis.stockAltM[k]),
+                borderColor: '#707070',
+                backgroundColor: 'rgba(0, 0, 0, 0)',
+                borderWidth: 1,
+                borderDash: [3, 3],
+                pointRadius: 0,
+            });
+        }
+        if (reasons.has(AltitudeReason.FOLLOW)) datasets.push(legendEntry(AltitudeReason.FOLLOW, 'missionTerrainChartFollow'));
+        if (reasons.has(AltitudeReason.TERRAIN_CLIMB)) datasets.push(legendEntry(AltitudeReason.TERRAIN_CLIMB, 'missionTerrainChartClimb'));
+        if (reasons.has(AltitudeReason.BELOW_MIN)) datasets.push(legendEntry(AltitudeReason.BELOW_MIN, 'missionTerrainChartBelow'));
+
+        const heights = [];
+        [terrainData, predictedData, waypointData].forEach(points => points.forEach(point => {
+            if (point.y !== null && Number.isFinite(point.y)) heights.push(point.y);
+        }));
+        const yMin = Math.floor(-10 + (heights.length ? Math.min(...heights) : 0));
+        const yMax = Math.ceil(10 + (heights.length ? Math.max(...heights) : 100));
+
+        const source = terrainSourceText(analysis.sources);
+        const title = source ? `${chartTitle} (${source})` : chartTitle;
+        const newData = {datasets};
+
+        if (elevationChartInstance && elevationChartKind === 'terrain' && elevationChartInstance.canvas === ctx) {
+            elevationChartInstance.data = newData;
+            elevationChartInstance.options.plugins.title.text = title;
+            elevationChartInstance.options.scales.y.min = yMin;
+            elevationChartInstance.options.scales.y.max = yMax;
+            elevationChartInstance.update('none');
+            return;
+        }
+        if (elevationChartInstance) {
+            elevationChartInstance.destroy();
+        }
+        elevationChartKind = 'terrain';
+        elevationChartInstance = new Chart(ctx, {
+            type: 'line',
+            data: newData,
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                animation: false,
+                plugins: {
+                    title: {display: true, text: title},
+                    legend: {display: true, position: 'top'}
+                },
+                scales: {
+                    x: {type: 'linear', title: {display: true, text: 'Distance (m)'}},
+                    y: {title: {display: true, text: 'Elevation (m)'}, min: yMin, max: yMax}
+                }
+            }
+        });
+    }
 
     function plotElevation() {
         if ($('#missionPlannerElevation').is(":visible") && !disableMarkerEdit) {
@@ -8257,6 +8962,7 @@ function iconKey(filename) {
                 }
 
                 // Create empty chart with message
+                elevationChartKind = 'legacy';
                 elevationChartInstance = new Chart(ctx, {
                     type: 'line',
                     data: {
@@ -8320,6 +9026,25 @@ function iconKey(filename) {
                     const currentSequence = ++elevationUpdateSequence;
 
                     try {
+                        // The terrain analysis gives the fuller picture: every leg sampled, each
+                        // leg's minimum, and the altitude the aircraft is predicted to fly. It
+                        // needs altitudes above sea level, so a mission of relative altitudes
+                        // without a home elevation falls through to the older chart below.
+                        const analysis = await runTerrainAnalysis();
+                        if (currentSequence !== elevationUpdateSequence) {
+                            return;
+                        }
+                        if (analysis && analysis.sampling.samples.length > 1 && analysis.altM.some(value => value !== null)) {
+                            const number = multimissionCount ? ' ' + ($('#multimissionOptionList').val()) : '';
+                            drawTerrainChart(analysis, 'Mission' + number + ' Elevation Profile');
+                            return;
+                        }
+                        if (elevationChartKind !== 'legacy' && elevationChartInstance) {
+                            elevationChartInstance.destroy();
+                            elevationChartInstance = null;
+                        }
+                        elevationChartKind = 'legacy';
+
                         const [lengthMission, totalMissionDistance, samples, elevation, altPoint2measure, namePoint2measure, refPoint2measure] = await mission.getElevation(globalSettings);
 
                         // Check if a newer update has been triggered while we were fetching data

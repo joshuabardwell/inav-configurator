@@ -1974,6 +1974,10 @@ var mspHelper = (function () {
             case MSPCodes.MSP2_INAV_ESC_SRXL2_CALIBRATE:
                 break;
 
+            case MSPCodes.MSP2_INAV_TERRAIN_HEIGHT:
+                // decoded by its caller, js/terrainMsp.js
+                break;
+
             default:
                 console.log('Unknown code detected: 0x' + dataHandler.code.toString(16));
         } else {

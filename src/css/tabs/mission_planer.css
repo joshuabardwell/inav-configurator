@@ -645,6 +645,32 @@
     color: #888;
 }
 
+.tab-mission-control .mpTerrainFolderButton {
+    margin-right: 8px;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.tab-mission-control .mpTerrainFolderPath {
+    margin-top: 3px;
+    overflow-wrap: anywhere;
+}
+
+.tab-mission-control .mpTerrainFolderStatus {
+    margin-top: 2px;
+    color: #b35c00;
+    overflow-wrap: anywhere;
+}
+
+.tab-mission-control .elevationSource {
+    margin-left: 6px;
+    color: #707070;
+}
+
+.tab-mission-control .elevationSource.fromTerrainFile {
+    color: #28a745;
+}
+
 .tab-mission-control .mpApplySaved {
     margin-left: 6px;
     color: #28a745;

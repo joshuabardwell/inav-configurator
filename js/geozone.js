@@ -1,6 +1,6 @@
 'use strict'
 
-import elevationFetch from './elevationFetch';
+import { getElevation as lookUpElevation } from './elevationProvider.js';
 
 
 const GeozoneType = Object.freeze({
@@ -253,12 +253,12 @@ let Geozone = function (type, shape, minAltitude, maxAltitude, sealevelRef, radi
     }
 
     self.getElevationFromServer = async function (lon, lat, globalSettings) {
+        // Terrain folder first, online lookup otherwise (js/elevationProvider.js).
         let elevation = "N/A";
         try {
-            const response = await elevationFetch('https://api.opentopodata.org/v1/aster30m?locations='+lat+','+lon);
-            const myJson = await response.json();
-            if (myJson.status == "OK" && myJson.results[0].elevation != null) {
-                elevation = myJson.results[0].elevation;
+            const result = await lookUpElevation(lat, lon);
+            if (result.elevation != null) {
+                elevation = result.elevation;
             }
         } catch (error) {
             console.log('Elevation lookup failed: ' + error.message);

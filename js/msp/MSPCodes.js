@@ -282,7 +282,11 @@ var MSPCodes = {
     MSP2_SET_MZTC_SHUTTER:              0x2246,
     MSP2_SET_MZTC_IMAGE_PARAMS:         0x2247,
     MSP2_SET_MZTC_CORRECTION:           0x2248,
-    MSP2_SET_MZTC_VIGNETTING:           0x2249
+    MSP2_SET_MZTC_VIGNETTING:           0x2249,
+
+    // Fork-local commands (not in upstream INAV), from 0x2F00.
+    // 0x2F00 and 0x2F01 are the vtxtable size commands (branch jb/vtxtable).
+    MSP2_INAV_TERRAIN_HEIGHT:           0x2F02  // terrain height from the SD card map, see js/terrain_msp_codec.js
 
 };
 
