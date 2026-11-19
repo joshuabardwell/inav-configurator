@@ -2564,8 +2564,10 @@ function iconKey(filename) {
                 missionPlannerSettings.maxDistSH = settings.maxDistSH;
                 missionPlannerSettings.fwLoiterRadius = settings.fwLoiterRadius;
             }
-            saveSettings();
+            // Adopt the stored settings first, then save: the other way round wrote the
+            // built-in defaults over them, so they were gone the next time the tab loaded.
             settings = missionPlannerSettings;
+            saveSettings();
         }
         refreshSettings();
     }
