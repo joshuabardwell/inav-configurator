@@ -652,6 +652,19 @@
     white-space: nowrap;    /* a link wraps to the next line whole, not in the middle */
 }
 
+/* The folder's path is the link that chooses another folder. */
+.tab-mission-control a.mpTerrainFolderLink {
+    display: block;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+/* "Build" next to a height that did not come from a terrain file. */
+.tab-mission-control .elevationBuild {
+    margin-left: 6px;
+    margin-right: 0;
+}
+
 /* The terrain folder's help popup. jBox puts it under <body>, outside the tab. */
 .jBox-Tooltip.mpWideTooltip {
     max-width: none;

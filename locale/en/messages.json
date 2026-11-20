@@ -400,7 +400,7 @@
         "message": "Terrain files (.TER) are kept here. Mission Control reads them, and they copy straight to the flight controller's SD card."
     },
     "mapgenTerrainFolderChoose": {
-        "message": "Change Folder"
+        "message": "Click to choose another folder"
     },
     "mapgenTerrainFolderOpen": {
         "message": "Open Folder"
@@ -5779,7 +5779,7 @@
         "message": "Terrain folder: "
     },
     "missionTerrainFolderChoose": {
-        "message": "Choose..."
+        "message": "Click to choose another folder"
     },
     "missionTerrainFolderOpen": {
         "message": "Open folder"
@@ -5796,14 +5796,8 @@
     "missionTerrainFolderCountOne": {
         "message": "$1 terrain file, $2."
     },
-    "missionTerrainFolderBuildMissing": {
-        "message": "Build them"
-    },
     "missionTerrainFolderNotFound": {
         "message": "The terrain folder cannot be opened: $1"
-    },
-    "missionTerrainFolderMissingTiles": {
-        "message": "No terrain file in the folder for: $1. Heights there come from the online sources, and Follow is not available."
     },
     "missionTerrainFolderDialogTitle": {
         "message": "Select the folder to keep terrain files (.TER) in"
@@ -5848,7 +5842,7 @@
         "message": "Follow: hold the ground distance"
     },
     "missionTerrainFollowNeedsTerrain": {
-        "message": "Follow needs the ground height at this waypoint from a terrain file. Build the file for this area: answer \"Build\" when asked, or use \"Build them\" in the settings box."
+        "message": "Follow needs the ground height at this waypoint from a terrain file. Build the file for this area: answer \"Build\" when asked, or use \"Build\" next to the waypoint's elevation."
     },
     "missionTerrainFollowNeedsHome": {
         "message": "Follow needs a home position for a waypoint whose altitude is relative to home, or switch the waypoint to Sea level Ref."
@@ -5934,6 +5928,15 @@
     "missionElevationSourceTerSea": {
         "message": "terrain file (sea level)"
     },
+    "missionElevationSourceNoFile": {
+        "message": "no terrain file"
+    },
+    "missionElevationSourceBuilding": {
+        "message": "building terrain file"
+    },
+    "missionElevationSourceBuild": {
+        "message": "Build"
+    },
     "missionElevationSourceCopernicus": {
         "message": "Copernicus (online)"
     },
@@ -5941,7 +5944,7 @@
         "message": "ASTER (online)"
     },
     "missionElevationSourceLoading": {
-        "message": "loading"
+        "message": "checking"
     },
     "missionElevationSourceNoteCopernicus": {
         "message": "The planner reads ground heights from the terrain files (.TER) in this folder, the files the flight controller reads from its SD card: copy them to the card. Where there is no file yet, heights come from the Copernicus server, or from ASTER where Copernicus has none. Elevation data: $1."

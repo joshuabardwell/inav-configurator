@@ -3,6 +3,7 @@ import { describe, test } from 'node:test';
 
 import {
     ElevationSource,
+    TerFileState,
     TileDownload,
     buildTiles,
     canBuildTiles,
@@ -17,7 +18,8 @@ import {
     isLocalTerrainActive,
     setTileDownload,
     setTileWantedListener,
-    summariseSources
+    summariseSources,
+    terFileState
 } from '../js/elevationProvider.js';
 import {
     TERRAIN_BLK_SPACE_X,
@@ -485,6 +487,58 @@ describe('elevation provider: cells with no terrain file', () => {
         assert.deepEqual(log.opens, []);
         assert.equal(log.urls.length, 0);
         assert.equal(calls.length, 0);
+    });
+
+    test('terFileState: missing, building, present, and none without a folder', async () => {
+        const log = buildHarness();
+        assert.deepEqual(await terFileState(IN_FILE.lat, IN_FILE.lon),
+            { state: TerFileState.MISSING, name: 'N47E008.TER', lat: 47, lon: 8, stale: false });
+
+        log.pending = true;
+        assert.equal((await terFileState(IN_FILE.lat, IN_FILE.lon)).state, TerFileState.BUILDING);
+        log.pending = false;
+
+        log.land({ name: 'N47E008.TER', lat: 47, lon: 8 });
+        assert.deepEqual(await terFileState(IN_FILE.lat, IN_FILE.lon),
+            { state: TerFileState.PRESENT, name: 'N47E008.TER', lat: 47, lon: 8, stale: false });
+        assert.deepEqual(await terFileState(-33.5, -70.5),
+            { state: TerFileState.MISSING, name: 'S34W071.TER', lat: -34, lon: -71, stale: false });
+
+        buildHarness({ folder: null });
+        assert.equal((await terFileState(IN_FILE.lat, IN_FILE.lon)).state, TerFileState.NONE);
+    });
+
+    test('terFileState asks the folder, and corrects what lookups remembered', async () => {
+        const log = buildHarness();
+        assert.equal((await getElevation(IN_FILE.lat, IN_FILE.lon)).source, ElevationSource.COPERNICUS);
+        // The file is copied in outside the app: lookups still remember it as missing.
+        log.files.add('X:/sd/N47E008.TER');
+        assert.equal((await getElevation(IN_FILE.lat, IN_FILE.lon)).source, ElevationSource.COPERNICUS);
+        assert.deepEqual(elevationSourceStatus().tilesMissing, ['N47E008.TER']);
+
+        const state = await terFileState(IN_FILE.lat, IN_FILE.lon);
+        assert.equal(state.state, TerFileState.PRESENT);
+        assert.equal(state.stale, true);
+        assert.deepEqual(elevationSourceStatus().tilesMissing, []);
+        assert.equal((await getElevation(IN_FILE.lat, IN_FILE.lon)).source, ElevationSource.TER);
+        assert.equal((await terFileState(IN_FILE.lat, IN_FILE.lon)).stale, false);
+
+        // And the other way: the file is deleted outside the app.
+        log.files.delete('X:/sd/N47E008.TER');
+        const gone = await terFileState(IN_FILE.lat, IN_FILE.lon);
+        assert.equal(gone.state, TerFileState.MISSING);
+        assert.equal(gone.stale, true);
+        assert.equal((await getElevation(IN_FILE.lat, IN_FILE.lon)).source, ElevationSource.COPERNICUS);
+    });
+
+    test('terFileState says building when a build starts while the folder is asked', async () => {
+        const log = buildHarness();
+        const original = log.files.has.bind(log.files);
+        log.files.has = (path) => {
+            log.pending = true;         // the build is queued while pathExists is under way
+            return original(path);
+        };
+        assert.equal((await terFileState(IN_FILE.lat, IN_FILE.lon)).state, TerFileState.BUILDING);
     });
 
     test('a mix of sources is summarised as mixed', async () => {
