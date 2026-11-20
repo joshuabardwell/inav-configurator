@@ -2635,7 +2635,6 @@ function iconKey(filename) {
         // The path is not passed through getMessage: it escapes its arguments for HTML,
         // and .text() would then show "&#x2F;" for every slash.
         $('#MPterrainFolderPath').text(terrainFolderIsDefault() ? folder + ' ' + i18n.getMessage('missionTerrainFolderIsDefault') : folder);
-        $('#MPterrainFolderDefault').toggle(!terrainFolderIsDefault());
         let listing = null;
         try {
             listing = await listTerrain();      // also reads the index the source labels use
@@ -2719,7 +2718,6 @@ function iconKey(filename) {
         setTileDownload(store.get(TILE_DOWNLOAD_KEY, TileDownload.ASK));
         $('#MPtileDownload').val(getTileDownload());
         $('#MPtileDownloadRow').toggle(canBuildTiles());
-        $('#MPelevationSourceNote').text(i18n.getMessage('missionElevationSourceNoteCopernicus', [COPERNICUS_NOTICE_1]));
         setTileWantedListener(canBuildTiles() ? queueTileDialog : null);
     }
 
@@ -2859,6 +2857,23 @@ function iconKey(filename) {
     function initElevationSourceUi() {
         $('#MPtileDownload').on('change', function () {
             applyTileDownload($(this).val());
+        });
+
+        // What the terrain folder is for, where heights come from without a file, and
+        // the Copernicus attribution: shown on hover over the help icon, to keep the
+        // settings box short. getMessage escapes the notice for the tooltip's HTML.
+        new jBox('Tooltip', {
+            attach: '#MPterrainFolderHelp',
+            content: i18n.getMessage('missionElevationSourceNoteCopernicus', [COPERNICUS_NOTICE_1]),
+            getContent: null,
+            // main.css caps every tooltip at 180 px, which makes this much text a tall
+            // column; the class lifts the cap for this one (src/css/tabs/mission_planer.css)
+            addClass: 'mpWideTooltip',
+            width: 340,
+            delayOpen: 100,
+            delayClose: 100,
+            position: {x: 'right', y: 'center'},
+            outside: 'x'
         });
 
         tileDialog.modal = new jBox('Modal', {

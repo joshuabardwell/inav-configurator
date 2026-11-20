@@ -649,6 +649,12 @@
     margin-right: 8px;
     text-decoration: underline;
     cursor: pointer;
+    white-space: nowrap;    /* a link wraps to the next line whole, not in the middle */
+}
+
+/* The terrain folder's help popup. jBox puts it under <body>, outside the tab. */
+.jBox-Tooltip.mpWideTooltip {
+    max-width: none;
 }
 
 .tab-mission-control .mpTerrainFolderPath {
