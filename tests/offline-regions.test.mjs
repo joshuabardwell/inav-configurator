@@ -5,7 +5,7 @@ import {
     cellIndex, cellFileBytes, hasCellFile, CELL_INDEX_INFO,
     cellsForBounds, cellsForRange, withNeighbours, wrapLon,
     REGIONS, regionById, lonToTileX, latToTileY, tileRanges, tilesInRanges,
-    elevationFile, elevationFileName, imageryLocalPath, planDownload, formatBytes, formatDuration,
+    elevationFile, elevationFileName, imageryLocalPath, imageryTotalsByZoom, planDownload, formatBytes, formatDuration,
 } from '../js/offline_regions.js';
 
 const keys = cells => cells.map(c => `${c.lat}_${c.lon}`);
@@ -150,4 +150,25 @@ test('formatting', () => {
     assert.equal(formatDuration(30), 'under a minute');
     assert.equal(formatDuration(3 * 3600 + 5 * 60), '3 h 5 min');
     assert.equal(formatDuration(5 * 86400), '5 days');
+});
+
+test('imageryTotalsByZoom adds up from zoom 0 and matches planDownload', () => {
+    const r = regionById('usa48');
+    const bounds = { south: r.lat0, west: r.lon0, north: r.lat1 + 1, east: r.lon1 + 1 };
+    const layers = ['esri_satellite', 'esri_labels'];
+    const totals = imageryTotalsByZoom(bounds, layers, 12);
+    assert.equal(totals.length, 13);
+    assert.equal(totals[0].tiles, 1);
+    for (let z = 1; z <= 12; z++) assert.ok(totals[z].tiles > totals[z - 1].tiles);
+    for (const z of [0, 5, 12]) {
+        const p = planDownload({ cells: [], present: null, imagery: { ...bounds, zMax: z, layers } });
+        assert.equal(totals[z].tiles, p.imagery.tiles, `z${z}`);
+        assert.equal(totals[z].bytes, p.imagery.bytes, `z${z}`);
+    }
+    // A box across the 180° meridian counts both halves.
+    const wrap = imageryTotalsByZoom({ south: -20, west: 170, north: -10, east: 190 }, ['esri_satellite'], 6);
+    const p = planDownload({ cells: [], present: null, imagery: { south: -20, west: 170, north: -10, east: 190, zMax: 6, layers: ['esri_satellite'] } });
+    assert.equal(wrap[6].tiles, p.imagery.tiles);
+    // No layers: tiles are counted, bytes are zero.
+    assert.equal(imageryTotalsByZoom(bounds, [], 3)[3].bytes, 0);
 });

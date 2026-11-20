@@ -209,6 +209,20 @@ export const IMAGERY_LAYERS = {
     },
 };
 
+// Imagery size of a download to each zoom from 0 to zMax: entry z is
+// { z, tiles, bytes } for zooms 0..z together, as the downloader always starts
+// at zoom 0. Feeds the size shown next to each choice in the zoom menu.
+export function imageryTotalsByZoom({ south, west, north, east }, layers, zMax) {
+    const perTile = layers.reduce((s, id) => s + IMAGERY_LAYERS[id].avgBytes, 0);
+    const out = [];
+    let tiles = 0;
+    for (const r of tileRanges(south, west, north, east, 0, zMax)) {
+        tiles += r.count;
+        out[r.z] = { z: r.z, tiles, bytes: tiles * perTile };
+    }
+    return out;
+}
+
 export function imageryLocalPath(provider, type, z, x, y, ext) {
     return `imagery/${provider}/${type}/${z}/${x}/${y}.${ext}`;
 }
