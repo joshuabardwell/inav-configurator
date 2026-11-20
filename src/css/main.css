@@ -2567,3 +2567,76 @@ ol li {
     border-radius: 3px;
     border: 1px solid #000000;
 }
+
+/* ── Terrain folder block ─────────────────────────────────────────────────
+   Shown in Mission Control's settings box and in the Map Generator, with one
+   look in both: the folder's path (the link that chooses another folder),
+   then "Restore default | Open folder", then the file count. The tab class in
+   each selector outranks the tabs' own rules for links. */
+.tab-mission-control .terrainFolder-path,
+.tab-map_generator .terrainFolder-path,
+.tab-mission-control .terrainFolder-actions a,
+.tab-map_generator .terrainFolder-actions a {
+    font-family: 'open_sansregular', 'Segoe UI', Tahoma, sans-serif;
+    font-size: inherit;
+    font-weight: normal;
+    color: #303030;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.tab-mission-control .terrainFolder-path:hover,
+.tab-map_generator .terrainFolder-path:hover,
+.tab-mission-control .terrainFolder-actions a:hover,
+.tab-map_generator .terrainFolder-actions a:hover {
+    color: #37a8db;
+}
+
+.tab-mission-control .terrainFolder-path,
+.tab-map_generator .terrainFolder-path {
+    display: block;
+    margin: 4px 0 0;
+    padding: 0;
+    overflow-wrap: anywhere;
+}
+
+.tab-mission-control .terrainFolder-actions,
+.tab-map_generator .terrainFolder-actions {
+    display: flex;
+    flex-wrap: wrap;        /* a box too narrow for both links puts the second on its own line */
+    align-items: center;
+    row-gap: 2px;
+    margin-top: 6px;
+}
+
+.tab-mission-control .terrainFolder-actions a,
+.tab-map_generator .terrainFolder-actions a {
+    white-space: nowrap;
+}
+
+/* "Restore default" while the default folder is already the active one */
+.tab-mission-control .terrainFolder-actions a.terrainFolder-off,
+.tab-map_generator .terrainFolder-actions a.terrainFolder-off {
+    color: #999;
+    text-decoration: none;
+    cursor: default;
+    pointer-events: none;
+}
+
+/* The divider between the two links. It must not shrink: in a narrow box a
+   flex item with no minimum goes to zero width and the divider disappears. */
+.terrainFolder-sep {
+    flex: 0 0 1px;
+    width: 1px;
+    height: 1.1em;
+    margin: 0 12px;
+    background-color: #b0b0b0;
+}
+
+.tab-mission-control .terrainFolder-count,
+.tab-map_generator .terrainFolder-count {
+    margin-top: 6px;
+    color: #707070;
+    font-size: inherit;
+    overflow-wrap: anywhere;
+}
