@@ -217,17 +217,6 @@
     padding: 4px;
 }
 
-/* The terrain folder's path is the link that chooses another folder. */
-.tab-map_generator a.mapgen-folder-link {
-    display: block;
-    text-decoration: underline;
-    cursor: pointer;
-}
-
-.tab-map_generator a.mapgen-folder-link:hover {
-    color: #37a8db;
-}
-
 .tab-map_generator .mapgen-sd-path.linked {
     color: #4CAF50;
     font-weight: bold;

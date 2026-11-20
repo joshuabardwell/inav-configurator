@@ -110,10 +110,13 @@
                     </div>
                     <div class="spacer_box">
                         <div class="mapgen-offline-hint" data-i18n="mapgenTerrainFolderHint">Terrain files (.TER) are kept here. Mission Control reads them, and they copy straight to the flight controller's SD card.</div>
-                        <a class="mapgen-sd-path mapgen-folder-link" id="mapgen_terrain_folder_path" href="#" data-i18n_title="mapgenTerrainFolderChoose" title="Click to choose another folder"></a>
-                        <div class="mapgen-offline-sizes" id="mapgen_terrain_folder_info"></div>
-                        <a id="mapgen_terrain_folder_default" class="btn" href="#" data-i18n="mapgenTerrainFolderDefault">Restore Default</a>
-                        <a id="mapgen_terrain_folder_open" class="btn" href="#" data-i18n="mapgenTerrainFolderOpen">Open Folder</a>
+                        <a class="terrainFolder-path" id="mapgen_terrain_folder_path" href="#" data-i18n_title="mapgenTerrainFolderChoose" title="Click to choose another folder"></a>
+                        <div class="terrainFolder-actions">
+                            <a id="mapgen_terrain_folder_default" href="#" data-i18n="mapgenTerrainFolderDefault">Restore default</a>
+                            <span class="terrainFolder-sep"></span>
+                            <a id="mapgen_terrain_folder_open" href="#" data-i18n="mapgenTerrainFolderOpen">Open folder</a>
+                        </div>
+                        <div class="terrainFolder-count" id="mapgen_terrain_folder_info"></div>
                     </div>
                 </div>
 

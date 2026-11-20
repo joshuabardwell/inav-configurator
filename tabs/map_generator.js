@@ -1935,7 +1935,9 @@ TABS.map_generator.initialize = function (callback) {
             terrainFree = await globalThis.electronAPI.diskFree(terrainFolderDir()) ?? null;
 
             const dir = terrainFolderDir();
-            $('#mapgen_terrain_folder_path').text(terrainFolderIsDefault() ? dir + ' (default)' : dir);
+            $('#mapgen_terrain_folder_path').text(dir);
+            // "Restore default" is greyed out while the default folder is the active one.
+            $('#mapgen_terrain_folder_default').toggleClass('terrainFolder-off', terrainFolderIsDefault());
             let summary = 'No terrain files yet.';
             if (listing && listing.count > 0) {
                 summary = `${listing.count.toLocaleString()} terrain file${listing.count > 1 ? 's' : ''}, ${formatBytes(listing.bytes)}.`;

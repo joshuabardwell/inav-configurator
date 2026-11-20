@@ -2632,9 +2632,9 @@ function iconKey(filename) {
         if (!terrainLibraryAvailable()) return;
         const run = ++terrainFolderDisplayRun;
         const folder = terrainFolderDir();
-        // The path is not passed through getMessage: it escapes its arguments for HTML,
-        // and .text() would then show "&#x2F;" for every slash.
-        $('#MPterrainFolderPath').text(terrainFolderIsDefault() ? folder + ' ' + i18n.getMessage('missionTerrainFolderIsDefault') : folder);
+        $('#MPterrainFolderPath').text(folder);
+        // "Restore default" is greyed out while the default folder is the active one.
+        $('#MPterrainFolderDefault').toggleClass('terrainFolder-off', terrainFolderIsDefault());
         let listing = null;
         try {
             listing = await listTerrain();      // also reads the index the source labels use
