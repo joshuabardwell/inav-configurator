@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { downloadToFile, writeFileAtomic, listFiles, dirSize, diskFree } from '../js/main/offline_store.js';
+import { downloadToFile, writeFileAtomic, copyFileAtomic, ensureFolder, listFiles, dirSize, diskFree } from '../js/main/offline_store.js';
 
 async function withTempDir(fn) {
     const dir = await mkdtemp(path.join(tmpdir(), 'offline-store-'));
@@ -41,6 +41,27 @@ test('dirSize totals nested files', () => withTempDir(async dir => {
 test('diskFree walks up to an existing folder', () => withTempDir(async dir => {
     const free = await diskFree(path.join(dir, 'not', 'yet', 'made'));
     assert.ok(free > 0);
+}));
+
+test('copyFileAtomic copies into a new folder and reports a missing source', () => withTempDir(async dir => {
+    const src = path.join(dir, 'N47E008.TER');
+    await writeFile(src, 'terrain');
+    const dest = path.join(dir, 'card', 'N47E008.TER');
+    assert.equal(await copyFileAtomic(src, dest), false);
+    assert.equal(await readFile(dest, 'utf8'), 'terrain');
+    assert.deepEqual(await listFiles(path.join(dir, 'card')), [{ name: 'N47E008.TER', size: 7 }]);
+    assert.equal(typeof await copyFileAtomic(path.join(dir, 'nope.TER'), dest), 'string');
+    assert.equal(await readFile(dest, 'utf8'), 'terrain');
+}));
+
+test('ensureFolder creates a folder and refuses a file or a relative path', () => withTempDir(async dir => {
+    const folder = path.join(dir, 'INAV Terrain', 'Default');
+    assert.equal(await ensureFolder(folder), false);
+    assert.deepEqual(await listFiles(folder), []);
+    const file = path.join(dir, 'run.bat');
+    await writeFile(file, 'x');
+    assert.equal(typeof await ensureFolder(file), 'string');
+    assert.equal(typeof await ensureFolder('relative/folder'), 'string');
 }));
 
 test('downloadToFile refuses non-https URLs and skips existing files', () => withTempDir(async dir => {

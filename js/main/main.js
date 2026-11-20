@@ -12,7 +12,7 @@ import tcp from './tcp';
 import udp from './udp';
 import serial from './serial';
 import child_process from './child_process';
-import { downloadToFile, abortDownloads, writeFileAtomic, diskFree, listFiles, dirSize } from './offline_store';
+import { downloadToFile, abortDownloads, writeFileAtomic, copyFileAtomic, ensureFolder, diskFree, listFiles, dirSize } from './offline_store';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -526,6 +526,16 @@ app.whenReady().then(() => {
   });
   ipcMain.handle('listFiles', (_event, dir) => listFiles(dir));
   ipcMain.handle('dirSize', (_event, dir) => dirSize(dir));
+  ipcMain.handle('copyFileAtomic', (_event, src, dest) => copyFileAtomic(src, dest));
+  ipcMain.handle('ensureFolder', (_event, dir) => ensureFolder(dir));
+  // Shows a folder in the system's file manager (the terrain folder). Returns
+  // false on success, else why it was not opened.
+  ipcMain.handle('openFolder', async (_event, dir) => {
+    const error = await ensureFolder(dir);
+    if (error) return error;
+    shell.openPath(dir); // fire-and-forget: xdg-open on Linux never exits
+    return false;
+  });
 
   ipcMain.handle('ejectDrive', (_event, driveLetter) => {
     return new Promise(resolve => {

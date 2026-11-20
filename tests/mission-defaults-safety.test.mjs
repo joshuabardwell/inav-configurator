@@ -32,7 +32,7 @@ function deferred() {
 }
 function waypoint(number, action = 1) {
     const data = {Number: number, Action: action, LatMap: 47, LonMap: 8, Alt: 5000, P1: 0, P2: 0, P3: 0, MultiMissionIdx: 0};
-    const wp = {getElevation: async () => 250, getElevationSource: () => 'none'};
+    const wp = {getElevation: async () => 250, getElevationSource: () => 'none', getElevationFile: () => null};
     for (const key of Object.keys(data)) {
         wp['get' + key] = () => data[key];
         wp['set' + key] = value => {data[key] = value;};

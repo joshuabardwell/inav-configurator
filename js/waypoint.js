@@ -9,6 +9,7 @@ let Waypoint = function (number, action, lat, lon, alt=0, p1=0, p2=0, p3=0, endM
     let attachedNumber = "undefined";
     let poiNumber = "undefined";
     let elevationSource = "none";
+    let elevationFile = null;
 
     self.getNumber = function () {
         return number;
@@ -146,14 +147,16 @@ let Waypoint = function (number, action, lat, lon, alt=0, p1=0, p2=0, p3=0, endM
         return multiMissionIdx;
     }
 
-    // Ground elevation in metres, or "N/A". Comes from the terrain folder when one is
-    // chosen and has the tile, otherwise from the online lookup (js/elevationProvider.js).
+    // Ground elevation in metres, or "N/A". Comes from the terrain folder when it has
+    // the file, otherwise from the online lookup (js/elevationProvider.js).
     self.getElevation = async function (globalSettings) {
         let elevation = "N/A";
         elevationSource = "none";
+        elevationFile = null;
         try {
             const result = await lookUpElevation(self.getLatMap(), self.getLonMap());
             elevationSource = result.source;
+            elevationFile = result.file || null;
             if (result.elevation != null) {
                 elevation = result.elevation;
             }
@@ -164,9 +167,14 @@ let Waypoint = function (number, action, lat, lon, alt=0, p1=0, p2=0, p3=0, endM
     }
 
     // Where the last getElevation() answer came from: an ElevationSource value of
-    // js/elevationProvider.js ("ter", "copernicus", "aster-fallback", ... or "none").
+    // js/elevationProvider.js ("ter", "copernicus", "aster" or "none").
     self.getElevationSource = function () {
         return elevationSource;
+    }
+
+    // Name of the terrain file that answer was read from (N47E008.TER), or null.
+    self.getElevationFile = function () {
+        return elevationFile;
     }
 
     return self;

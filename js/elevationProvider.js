@@ -4,26 +4,24 @@
  * Ground elevation for the mission planner.
  *
  * Sources, tried in this order for every point:
- *   1. a folder of INAV terrain tiles (.TER), read the way the firmware reads
- *      them (js/terrain_ter.js), so the planner sees the ground the flight
- *      controller will see;
- *   2. the source chosen in the planner's settings, for points the folder has
- *      no tile for, or when no folder is chosen:
- *        Copernicus GLO-30  the tile saved in the offline data folder, else the
- *                           tile on the server read with range requests;
- *        NASA SRTM          the tile saved in the offline data folder, else
- *                           opentopodata's srtm30m;
- *        ASTER              opentopodata's aster30m (what the planner always used);
- *   3. ASTER, for points the chosen source could not answer.
+ *   1. the terrain folder (js/terrain_library.js): INAV terrain files (.TER), read
+ *      the way the firmware reads them (js/terrain_ter.js), so the planner sees
+ *      the ground the flight controller will see;
+ *   2. for a point whose cell has no file in the folder, by what that file would
+ *      be built from (cellBuildEstimate in js/offline_regions.js):
+ *        Copernicus GLO-30  the tile on the server, read with range requests;
+ *        all sea            0 m, with no request;
+ *        land Copernicus leaves out (built from SRTM): nothing here, see 3;
+ *   3. ASTER (opentopodata's aster30m) for points still without an answer.
  *
- * A Copernicus or SRTM tile that is not in the offline folder can be downloaded
- * into it: the planner is told which tiles a lookup would have used
- * (setTileWantedListener) and answers with downloadTiles() or declineTiles().
- * Lookups never wait for that: they use the server until the file is there.
+ * A cell with no file in the folder can have one built: the planner is told which
+ * files a lookup would have used (setTileWantedListener) and answers with
+ * buildTiles() or declineTiles(). Lookups never wait for that: they use the
+ * server until the file is there, and read the file from then on.
  *
  * Every answer says which source it came from. The module has no DOM and no
- * direct file access: file reads, downloads and the online fetch are injected,
- * with defaults that use the Electron bridge, js/offline_folder.js,
+ * direct file access: file reads, the terrain folder and the online fetch are
+ * injected, with defaults that use the Electron bridge, js/terrain_library.js,
  * js/terrain_point.js and js/elevationFetch.js.
  */
 
@@ -34,69 +32,53 @@ import {
     terBlockOffset,
     terDecodeBlock,
     terGridInfo,
-    terTileName
+    terTileName,
+    terrainDatFilename
 } from './terrain_ter.js';
-import { cellFileBytes, elevationFile } from './offline_regions.js';
+import { cellBuildEstimate } from './offline_regions.js';
 import {
-    offlineFolderAvailable,
-    offlineFolderExists,
-    offlineFolderPath,
-    offlineFolderRead,
-    offlineFolderReadSlices
-} from './offline_folder.js';
-import { copernicusLocalPath, decompressGz, makeHgtView, srtmLocalPath } from './terrain_elevation.js';
-import { cellOf, createPointSampler, openCopernicusRemote, openCopernicusSlices } from './terrain_point.js';
+    buildTerrain,
+    onTerrainChange,
+    terrainBuildPending,
+    terrainFolderDir,
+    terrainLibraryAvailable
+} from './terrain_library.js';
+import { cellOf, createPointSampler, openCopernicusRemote } from './terrain_point.js';
 
 export const ElevationSource = Object.freeze({
-    TER: 'ter',                             // local terrain tile
-    COPERNICUS: 'copernicus',               // Copernicus tile on the server (range read), or a sea cell
-    COPERNICUS_SAVED: 'copernicus-saved',   // Copernicus tile in the offline folder
-    SRTM_SAVED: 'srtm-saved',               // SRTM tile in the offline folder
-    SRTM_ONLINE: 'srtm-online',             // opentopodata srtm30m
-    ASTER: 'aster',                         // opentopodata aster30m, chosen
-    ASTER_FALLBACK: 'aster-fallback',       // opentopodata aster30m, because the chosen source had no answer
-    NONE: 'none'                            // no data from any source
+    TER: 'ter',                 // terrain file in the terrain folder
+    COPERNICUS: 'copernicus',   // Copernicus tile on the server (range read), or a sea cell
+    ASTER: 'aster',             // opentopodata aster30m
+    NONE: 'none'                // no data from any source
 });
 
-/* What the planner uses for points the terrain folder does not cover. */
-export const OnlineSource = Object.freeze({
-    COPERNICUS: 'copernicus',
-    SRTM: 'srtm',
-    ASTER: 'aster'
-});
-
-/* What happens when a lookup would use a tile that is not in the offline folder. */
+/* What happens when a lookup would use a terrain file that is not in the folder. */
 export const TileDownload = Object.freeze({
     ASK: 'ask',         // tell the listener, which asks the user
-    ALWAYS: 'always',   // download it without asking
+    ALWAYS: 'always',   // build it without asking
     NEVER: 'never'      // leave it; keep using the server
 });
 
 const OPENTOPO_URL = 'https://api.opentopodata.org/v1/';
+const ASTER_DATASET = 'aster30m';
 const ONLINE_BATCH = 100;           // opentopodata accepts at most 100 locations per request
 const DEFAULT_ONLINE_LIMIT = 100;   // one request (they are spaced 1.1 s apart) per call unless the caller allows more
 const BLOCK_CACHE_LIMIT = 4000;     // decoded .TER blocks kept in memory (about 1.2 kB each)
 const ONLINE_CACHE_LIMIT = 5000;
 const REMOTE_RETRY_MS = 60000;      // after a Copernicus tile failed to open, leave the server alone this long
-// Copernicus has a file for every cell with land, except a few countries it leaves
-// out (Armenia, Azerbaijan). A cell without one is sea unless the SRTM file for it
-// is this big: sea cells there are about 1 MB, the left-out land 7-13 MB.
-const LAND_SRTM_BYTES = 2 * 1024 * 1024;
 
 let io = defaultIo();
-let terFolder = null;
-let onlineSource = OnlineSource.COPERNICUS;
+let terFolder = null;               // the folder the caches below belong to
 let tileDownload = TileDownload.ASK;
 let tileWantedListener = null;
 let sampler = makeSampler();
+let stopListening = null;
 const blockCache = new Map();       // "<tile>:<offset>" -> decoded block, or null when the slot holds no usable block
 const tileExists = new Map();       // .TER tile name -> boolean
-const onlineCache = new Map();      // "<dataset>:lat,lon" (5 decimals) -> metres or null
+const onlineCache = new Map();      // "lat,lon" (5 decimals) -> metres or null
 const tilesUsed = new Set();
 const tilesMissing = new Set();
-const savedTiles = new Set();       // "<source>:<lat>_<lon>" known to be in the offline folder
-const askedTiles = new Set();       // tiles the listener was told about, or the user declined, this session
-const downloads = new Map();        // tile key -> promise of a running download
+const askedTiles = new Set();       // files the listener was told about, or the user declined, this session
 const remoteFailedAt = new Map();   // "<lat>_<lon>" -> time a Copernicus tile failed to open on the server
 
 function defaultIo() {
@@ -106,49 +88,57 @@ function defaultIo() {
         fetchOnline: (url) => elevationFetch(url),
         localAvailable: () => typeof globalThis.electronAPI?.readFileRanges === 'function',
 
-        // The offline data folder and the elevation servers (js/terrain_point.js)
-        offlineAvailable: () => offlineFolderAvailable(),
-        savedExists: (relPath) => offlineFolderExists(relPath),
-        openCopernicus: (where, lat, lon) => (where === 'saved'
-            ? openCopernicusSlices(slices => offlineFolderReadSlices(copernicusLocalPath(lat, lon), slices))
-            : openCopernicusRemote(lat, lon)),
-        loadSrtmGrid: async (lat, lon) => {
-            const gz = await offlineFolderRead(srtmLocalPath(lat, lon));
-            return gz ? makeHgtView(await decompressGz(gz)) : null;
-        },
-        downloadFile: (url, relPath) => globalThis.electronAPI.downloadToFile(url, offlineFolderPath(relPath), { skipIfExists: true }),
-        cellBytes: (source, lat, lon) => cellFileBytes(source, lat, lon),
+        // The terrain folder (js/terrain_library.js)
+        terFolder: () => (terrainLibraryAvailable() ? terrainFolderDir() : null),
+        canBuild: () => terrainLibraryAvailable(),
+        buildTerrain: (cells, options) => buildTerrain(cells, options),
+        buildPending: (lat, lon) => terrainBuildPending(lat, lon),
+        onTerrainChange: (listener) => onTerrainChange(listener),
+
+        // The elevation servers (js/terrain_point.js) and the bundled cell index
+        openCopernicus: (lat, lon) => openCopernicusRemote(lat, lon),
+        cellInfo: (lat, lon) => cellBuildEstimate(lat, lon),
         now: () => Date.now()
     };
 }
 
 function makeSampler() {
     return createPointSampler({
-        openCopernicus: async (asked, lat, lon, neighbour) => {
+        openCopernicus: async (lat, lon, neighbour) => {
             const key = lat + '_' + lon;
-            // The tile next to the one a point is in is read from the folder when it
-            // is there and from the server when not, wherever the point's own tile is.
-            let where = asked;
-            if (neighbour) {
-                if (io.cellBytes(OnlineSource.COPERNICUS, lat, lon) <= 0) return null;
-                where = (await tileIsSaved(OnlineSource.COPERNICUS, { lat, lon })) ? 'saved' : 'remote';
-            }
-            if (where === 'remote' && remoteFailedAt.has(key)) {
+            // The tile south or east of the one a point is in: none there means sea.
+            if (neighbour && io.cellInfo(lat, lon).source !== 'copernicus') return null;
+            if (remoteFailedAt.has(key)) {
                 if (io.now() - remoteFailedAt.get(key) < REMOTE_RETRY_MS) {
                     throw new Error('tile ' + key + ' failed to open a moment ago');
                 }
                 remoteFailedAt.delete(key);
             }
             try {
-                return await io.openCopernicus(where, lat, lon);
+                return await io.openCopernicus(lat, lon);
             } catch (error) {
-                if (where === 'remote') remoteFailedAt.set(key, io.now());
+                remoteFailedAt.set(key, io.now());
                 throw error;
             }
-        },
-        loadSrtmGrid: (lat, lon) => io.loadSrtmGrid(lat, lon)
+        }
     });
 }
+
+function listenToFolder() {
+    if (stopListening) stopListening();
+    stopListening = io.onTerrainChange(event => {
+        if (event.type !== 'file' || event.dir !== terFolder) return;
+        // A file was written: what was remembered about that cell is out of date.
+        tileExists.delete(event.name);
+        tilesMissing.delete(event.name);
+        for (const key of [...blockCache.keys()]) {
+            if (key.startsWith(event.name + ':')) blockCache.delete(key);
+        }
+        sampler.forgetTile(event.lat, event.lon);
+    }) || null;
+}
+
+listenToFolder();
 
 /* Replace the file and network access (tests, other hosts). Omitted members keep their default. */
 export function configureElevationProvider(overrides = {}) {
@@ -156,66 +146,59 @@ export function configureElevationProvider(overrides = {}) {
     if (overrides.readFileRanges && !overrides.localAvailable) {
         io.localAvailable = () => true;
     }
+    terFolder = null;
     resetElevationCaches();
+    listenToFolder();
 }
 
 export function resetElevationCaches() {
-    blockCache.clear();
-    tileExists.clear();
+    forgetTerFiles();
     onlineCache.clear();
-    tilesUsed.clear();
-    tilesMissing.clear();
-    savedTiles.clear();
     askedTiles.clear();
-    downloads.clear();
     remoteFailedAt.clear();
     sampler = makeSampler();
 }
 
-/* Folder holding the .TER tiles (an SD card root or a copy of one), or null for none. */
-export function setTerFolder(folder) {
+/*
+ * Forgets which files the folder holds and what was read from them. Call it when
+ * files may have been copied into or removed from the folder outside the app.
+ */
+export function forgetTerFiles() {
+    blockCache.clear();
+    tileExists.clear();
+    tilesUsed.clear();
+    tilesMissing.clear();
+}
+
+/* The active terrain folder; a change of folder drops what was read from the old one. */
+function currentFolder() {
+    const folder = io.terFolder();
     const next = folder ? String(folder) : null;
     if (next !== terFolder) {
         terFolder = next;
-        blockCache.clear();
-        tileExists.clear();
-        tilesUsed.clear();
-        tilesMissing.clear();
+        forgetTerFiles();
     }
-}
-
-export function getTerFolder() {
     return terFolder;
 }
 
-/* True when a folder is chosen and this build can read files from it. */
-export function isLocalTerrainActive() {
-    return Boolean(terFolder) && io.localAvailable();
+/* Folder holding the .TER files, or null when this build has none. */
+export function getTerFolder() {
+    return currentFolder();
 }
 
-/* Which tiles the lookups so far found in the folder and which they did not. */
+/* True when there is a terrain folder and this build can read files from it. */
+export function isLocalTerrainActive() {
+    return Boolean(currentFolder()) && io.localAvailable();
+}
+
+/* Which files the lookups so far found in the folder and which they did not. */
 export function elevationSourceStatus() {
     return {
-        folder: terFolder,
+        folder: currentFolder(),
         localActive: isLocalTerrainActive(),
         tilesUsed: [...tilesUsed].sort(),
         tilesMissing: [...tilesMissing].sort()
     };
-}
-
-/* Source for points the terrain folder does not cover. An unknown value counts as Copernicus. */
-export function setOnlineSource(source) {
-    onlineSource = Object.values(OnlineSource).includes(source) ? source : OnlineSource.COPERNICUS;
-}
-
-export function getOnlineSource() {
-    return onlineSource;
-}
-
-/* True for Copernicus and SRTM: read from their own tiles they have no request limit,
-   so a path is sampled at the tiles' 30 m spacing. */
-export function onlineSourceUsesTiles() {
-    return onlineSource !== OnlineSource.ASTER;
 }
 
 /* An unknown value counts as "ask". */
@@ -227,15 +210,17 @@ export function getTileDownload() {
     return tileDownload;
 }
 
-/* True when this build has an offline data folder to keep tiles in. */
-export function canSaveTiles() {
-    return Boolean(io.offlineAvailable());
+/* True when this build has a terrain folder to build files into. */
+export function canBuildTiles() {
+    return Boolean(io.canBuild());
 }
 
 /*
- * listener(tiles) is called, at most once per tile per session, with the tiles a
- * lookup would have read from the offline folder had they been there:
- * [{ key, source, lat, lon, name, bytes }]. Only in "ask" mode. Null removes it.
+ * listener(tiles) is called, at most once per file per session, with the terrain
+ * files a lookup would have read had they been in the folder:
+ * [{ key, name, lat, lon, source, downloadBytes, terBytes }]. source is what the
+ * file is built from ('copernicus', 'srtm' or 'sea'). Only in "ask" mode. Null
+ * removes it.
  */
 export function setTileWantedListener(listener) {
     tileWantedListener = typeof listener === 'function' ? listener : null;
@@ -267,8 +252,8 @@ function rememberBlock(key, block) {
     blockCache.set(key, block);
 }
 
-/* Fills `heights[i]` for every point the folder has data for; leaves the rest undefined. */
-async function lookUpLocal(points, heights) {
+/* Fills `heights[i]` and `files[i]` for every point the folder has data for; leaves the rest undefined. */
+async function lookUpLocal(points, heights, files) {
     const wanted = new Map();   // tile -> Map(offset -> [{ index, info }])
 
     for (let index = 0; index < points.length; index++) {
@@ -287,7 +272,10 @@ async function lookUpLocal(points, heights) {
         if (blockCache.has(key)) {
             const block = blockCache.get(key);
             const height = block ? terBlockHeight(block, info) : null;
-            if (height !== null) heights[index] = height;
+            if (height !== null) {
+                heights[index] = height;
+                files[index] = tile;
+            }
             continue;
         }
         if (!wanted.has(tile)) wanted.set(tile, new Map());
@@ -314,131 +302,103 @@ async function lookUpLocal(points, heights) {
             if (!block) return;
             for (const { index, info } of users) {
                 const height = terBlockHeight(block, info);
-                if (height !== null) heights[index] = height;
+                if (height !== null) {
+                    heights[index] = height;
+                    files[index] = tile;
+                }
             }
         });
     }
 }
 
-// ─── Tiles in the offline folder ──────────────────────────────────────────────
+// ─── Terrain files that are not in the folder ─────────────────────────────────
 
-function tileKey(source, cell) {
-    return source + ':' + cell.lat + '_' + cell.lon;
-}
-
-function tileInfo(source, cell) {
-    const file = elevationFile(source, cell.lat, cell.lon);
+function tileInfo(cell) {
+    const name = terrainDatFilename(cell.lat, cell.lon);
+    const info = io.cellInfo(cell.lat, cell.lon);
     return {
-        key: tileKey(source, cell),
-        source,
+        key: name,
+        name,
         lat: cell.lat,
         lon: cell.lon,
-        name: file.name,
-        bytes: io.cellBytes(source, cell.lat, cell.lon),
-        url: file.url,
-        path: file.path
+        source: info.source,
+        downloadBytes: info.downloadBytes,
+        terBytes: info.terBytes
     };
 }
 
-async function tileIsSaved(source, cell) {
-    if (!io.offlineAvailable()) return false;
-    const key = tileKey(source, cell);
-    if (savedTiles.has(key)) return true;
-    let exists = false;
-    try {
-        exists = Boolean(await io.savedExists(elevationFile(source, cell.lat, cell.lon).path));
-    } catch (error) {
-        exists = false;
-    }
-    if (exists) savedTiles.add(key);
-    return exists;
-}
-
-function startDownload(tile) {
-    if (downloads.has(tile.key)) return downloads.get(tile.key);
-    const run = (async () => {
-        try {
-            const result = await io.downloadFile(tile.url, tile.path);
-            const status = result ? result.status : 'error';
-            const ok = status === 'exists' || (typeof status === 'number' && status >= 200 && status < 300);
-            if (ok) {
-                savedTiles.add(tile.key);
-                sampler.forgetTile(tile.lat, tile.lon);
-                return { tile, ok: true };
-            }
-            return { tile, ok: false, error: (result && result.error) || 'HTTP ' + status };
-        } catch (error) {
-            return { tile, ok: false, error: String(error?.message || error) };
-        } finally {
-            downloads.delete(tile.key);
-        }
-    })();
-    downloads.set(tile.key, run);
-    return run;
+function keyOf(tile) {
+    return tile.key || terrainDatFilename(tile.lat, tile.lon);
 }
 
 /*
- * Downloads tiles into the offline folder, one after the other. onProgress is
- * called before each one with { done, total, tile }. Resolves to
- * { downloaded: [tile], failed: [{ tile, error }] }. Lookups made after a tile
- * arrived read it from the folder.
+ * Builds terrain files into the folder, one after the other. onProgress is called
+ * with { done, total, tile, stage, stageDone, stageOf } as each one advances.
+ * Resolves to { built: [tile], failed: [{ tile, error }], aborted }. Lookups made
+ * after a file was written read it from the folder.
  */
-export async function downloadTiles(tiles, onProgress) {
-    const downloaded = [];
-    const failed = [];
-    for (let n = 0; n < tiles.length; n++) {
-        const tile = tiles[n].url ? tiles[n] : tileInfo(tiles[n].source, tiles[n]);
-        askedTiles.add(tile.key);
-        if (onProgress) onProgress({ done: n, total: tiles.length, tile });
-        const result = await startDownload(tile);
-        if (result.ok) {
-            downloaded.push(tile);
-        } else {
-            failed.push({ tile, error: result.error });
-        }
+export async function buildTiles(tiles, onProgress, signal) {
+    for (const tile of tiles) {
+        askedTiles.add(keyOf(tile));
     }
-    if (onProgress) onProgress({ done: tiles.length, total: tiles.length, tile: null });
-    return { downloaded, failed };
+    const outcome = await io.buildTerrain(tiles.map(tile => ({ lat: tile.lat, lon: tile.lon })), {
+        signal,
+        onProgress: onProgress ? (step) => onProgress({
+            done: step.index,
+            total: step.total,
+            tile: tiles[step.index],
+            stage: step.stage,
+            stageDone: step.done,
+            stageOf: step.of
+        }) : null
+    });
+    const byName = new Map(tiles.map(tile => [keyOf(tile), tile]));
+    return {
+        // a file that turned out to be there already counts as built
+        built: [...outcome.built.map(item => item.name), ...outcome.present].map(name => byName.get(name)).filter(Boolean),
+        failed: outcome.failed.map(item => ({ tile: byName.get(item.name), error: item.error })),
+        aborted: Boolean(outcome.aborted)
+    };
 }
 
-/* The user does not want these tiles: they are not asked about again this session. */
+/* The user does not want these files: they are not asked about again this session. */
 export function declineTiles(tiles) {
     for (const tile of tiles) {
-        askedTiles.add(tile.key || tileKey(tile.source, tile));
+        askedTiles.add(keyOf(tile));
     }
 }
 
-/* The listener was told about these tiles but the user never got to answer (the
+/* The listener was told about these files but the user never got to answer (the
    question was withdrawn): a later lookup may ask about them again. */
 export function forgetTileQuestions(tiles) {
     for (const tile of tiles) {
-        askedTiles.delete(tile.key || tileKey(tile.source, tile));
+        askedTiles.delete(keyOf(tile));
     }
 }
 
-// ─── opentopodata ─────────────────────────────────────────────────────────────
+// ─── opentopodata (ASTER) ─────────────────────────────────────────────────────
 
-function onlineKey(dataset, point) {
-    return dataset + ':' + Number(point.lat).toFixed(5) + ',' + Number(point.lon).toFixed(5);
+function onlineKey(point) {
+    return Number(point.lat).toFixed(5) + ',' + Number(point.lon).toFixed(5);
 }
 
 /* Asks opentopodata for each point (batched); returns metres or null per point. */
-async function fetchOnlineBatch(dataset, points) {
+async function fetchOnlineBatch(points) {
     const answers = new Array(points.length).fill(null);
     const pending = [];
     points.forEach((point, i) => {
-        const key = onlineKey(dataset, point);
+        const key = onlineKey(point);
         if (onlineCache.has(key)) {
             answers[i] = onlineCache.get(key);
         } else {
-            pending.push({ i, key, location: key.slice(dataset.length + 1) });
+            pending.push({ i, key });
         }
     });
 
     for (let start = 0; start < pending.length; start += ONLINE_BATCH) {
         const batch = pending.slice(start, start + ONLINE_BATCH);
         try {
-            const response = await io.fetchOnline(OPENTOPO_URL + dataset + '?locations=' + batch.map(entry => entry.location).join('|'));
+            const response = await io.fetchOnline(OPENTOPO_URL + ASTER_DATASET + '?locations=' + batch.map(entry => entry.key).join('|'));
             const body = await response.json();
             if (body.status !== 'OK' || !Array.isArray(body.results)) {
                 continue;
@@ -460,15 +420,16 @@ async function fetchOnlineBatch(dataset, points) {
 }
 
 /*
- * Fills results[index] for the given indices from one opentopodata dataset. When
- * there are more than `limit` of them, only that many (evenly spread, first and
- * last included) are asked for and the others are interpolated by position in the
- * list and marked coarse. Indices that got no answer keep what they had.
+ * Fills results[index] for the given indices from ASTER. When there are more than
+ * `limit` of them, only that many (evenly spread, first and last included) are
+ * asked for and the others are interpolated by position in the list and marked
+ * coarse. Indices that got no answer keep what they had.
  */
-async function lookUpOpenTopo(dataset, source, points, indices, limit, results) {
+async function lookUpAster(points, indices, limit, results) {
+    const source = ElevationSource.ASTER;
     if (indices.length === 0) return;
     if (indices.length <= limit) {
-        const answers = await fetchOnlineBatch(dataset, indices.map(i => points[i]));
+        const answers = await fetchOnlineBatch(indices.map(i => points[i]));
         indices.forEach((index, n) => {
             if (answers[n] !== null) {
                 results[index] = { elevation: answers[n], source };
@@ -481,7 +442,7 @@ async function lookUpOpenTopo(dataset, source, points, indices, limit, results) 
     for (let n = 0; n < limit; n++) {
         picked.push(Math.round(n * (indices.length - 1) / (limit - 1)));
     }
-    const answers = await fetchOnlineBatch(dataset, picked.map(n => points[indices[n]]));
+    const answers = await fetchOnlineBatch(picked.map(n => points[indices[n]]));
     let left = -1;
     for (let p = 0; p < picked.length; p++) {
         if (answers[p] === null) continue;
@@ -502,15 +463,15 @@ async function lookUpOpenTopo(dataset, source, points, indices, limit, results) 
     }
 }
 
-// ─── Copernicus and SRTM tiles ────────────────────────────────────────────────
+// ─── Cells without a terrain file ─────────────────────────────────────────────
 
 /*
- * Fills results[index] from the chosen tile source where it can. Leaves an index
- * alone when the source has no answer for it; those go to ASTER afterwards.
- * Returns the tiles that would have been read from the offline folder had they
- * been there.
+ * Fills results[index] where the cell's own data can answer: the Copernicus tile
+ * on the server, or 0 m for a sea cell. Leaves an index alone otherwise; those go
+ * to ASTER afterwards. Returns the terrain files that would have answered had
+ * they been in the folder.
  */
-async function lookUpTiles(source, points, indices, limit, results, network) {
+async function lookUpCells(points, indices, results, network) {
     const cells = new Map();    // "<lat>_<lon>" -> { cell, indices }
     for (const index of indices) {
         const cell = cellOf(Number(points[index].lat), Number(points[index].lon));
@@ -520,47 +481,28 @@ async function lookUpTiles(source, points, indices, limit, results, network) {
     }
 
     const wanted = [];
-    const viaOpenTopo = [];
+    const canBuild = isLocalTerrainActive() && io.canBuild();
     for (const { cell, indices: inCell } of cells.values()) {
-        if (io.cellBytes(source, cell.lat, cell.lon) <= 0) {
-            // Copernicus only: no file. Sea reads 0 m; left-out land goes to ASTER.
-            if (io.cellBytes('srtm', cell.lat, cell.lon) < LAND_SRTM_BYTES) {
-                for (const index of inCell) {
-                    results[index] = { elevation: 0, source: ElevationSource.COPERNICUS };
-                }
+        if (cell.lat < -90 || cell.lat > 89 || cell.lon < -180 || cell.lon > 179) continue;
+        const source = io.cellInfo(cell.lat, cell.lon).source;
+        if (source === 'sea') {
+            for (const index of inCell) {
+                results[index] = { elevation: 0, source: ElevationSource.COPERNICUS };
             }
-            continue;
         }
-
-        if (await tileIsSaved(source, cell)) {
-            const savedSource = source === OnlineSource.COPERNICUS ? ElevationSource.COPERNICUS_SAVED : ElevationSource.SRTM_SAVED;
-            const heights = await Promise.all(inCell.map(index => (source === OnlineSource.COPERNICUS
-                ? sampler.copernicusPoint('saved', Number(points[index].lat), Number(points[index].lon))
-                : sampler.srtmPoint(Number(points[index].lat), Number(points[index].lon)))));
-            inCell.forEach((index, n) => {
-                if (heights[n] !== null) results[index] = { elevation: heights[n], source: savedSource };
-            });
-            continue;
-        }
-
         if (!network) continue;
-        if (io.offlineAvailable() && !downloads.has(tileKey(source, cell))) {
-            wanted.push(tileInfo(source, cell));
+        // A file that is there but has no block for these points is not built again.
+        if (canBuild && !io.buildPending(cell.lat, cell.lon) &&
+            tileExists.get(terrainDatFilename(cell.lat, cell.lon)) !== true) {
+            wanted.push(tileInfo(cell));
         }
-        if (source === OnlineSource.COPERNICUS) {
+        if (source === 'copernicus') {
             const heights = await Promise.all(inCell.map(index =>
-                sampler.copernicusPoint('remote', Number(points[index].lat), Number(points[index].lon))));
+                sampler.copernicusPoint(Number(points[index].lat), Number(points[index].lon))));
             inCell.forEach((index, n) => {
                 if (heights[n] !== null) results[index] = { elevation: heights[n], source: ElevationSource.COPERNICUS };
             });
-        } else {
-            viaOpenTopo.push(...inCell);
         }
-    }
-
-    if (viaOpenTopo.length) {
-        viaOpenTopo.sort((a, b) => a - b);      // back into path order for the interpolation
-        await lookUpOpenTopo('srtm30m', ElevationSource.SRTM_ONLINE, points, viaOpenTopo, limit, results);
     }
     return wanted;
 }
@@ -568,8 +510,10 @@ async function lookUpTiles(source, points, indices, limit, results, network) {
 function handleWantedTiles(wanted) {
     if (wanted.length === 0) return;
     if (tileDownload === TileDownload.ALWAYS) {
-        for (const tile of wanted) {
-            startDownload(tile);
+        const fresh = wanted.filter(tile => !askedTiles.has(tile.key));
+        if (fresh.length) {
+            // Asked once per session: a file that failed to build is not retried on every lookup.
+            buildTiles(fresh).catch(error => console.log('Terrain build failed: ' + (error?.message || error)));
         }
         return;
     }
@@ -590,23 +534,25 @@ function handleWantedTiles(wanted) {
  * Elevation of each point in metres above sea level.
  *
  * points: [{ lat, lon }] in degrees. When more than `onlineLimit` of them need
- * opentopodata, only that many (evenly spread, first and last included) are
- * asked for and the others are interpolated by position in the list - so pass
- * the points in path order. `online: false` never goes to the network: only the
- * terrain folder and tiles already in the offline folder answer.
+ * ASTER, only that many (evenly spread, first and last included) are asked for
+ * and the others are interpolated by position in the list - so pass the points in
+ * path order. `online: false` never goes to the network: only the terrain folder
+ * answers (and sea cells, which need no request).
  *
- * Returns [{ elevation: number | null, source, coarse? }], one entry per point;
- * coarse marks an interpolated answer.
+ * Returns [{ elevation: number | null, source, file?, coarse? }], one entry per
+ * point; file names the terrain file an answer was read from, coarse marks an
+ * interpolated answer.
  */
 export async function getElevations(points, { online = true, onlineLimit = DEFAULT_ONLINE_LIMIT } = {}) {
     const heights = new Array(points.length);
+    const files = new Array(points.length);
     if (isLocalTerrainActive()) {
-        await lookUpLocal(points, heights);
+        await lookUpLocal(points, heights, files);
     }
 
     const results = points.map((_, i) => (heights[i] === undefined
         ? { elevation: null, source: ElevationSource.NONE }
-        : { elevation: Math.round(heights[i] * 10) / 10, source: ElevationSource.TER }));
+        : { elevation: Math.round(heights[i] * 10) / 10, source: ElevationSource.TER, file: files[i] }));
 
     const unanswered = () => {
         const list = [];
@@ -622,16 +568,8 @@ export async function getElevations(points, { online = true, onlineLimit = DEFAU
     if (missing.length === 0) {
         return results;
     }
-    const limit = Math.max(2, Math.floor(onlineLimit));
 
-    if (onlineSource === OnlineSource.ASTER) {
-        if (online) {
-            await lookUpOpenTopo('aster30m', ElevationSource.ASTER, points, missing, limit, results);
-        }
-        return results;
-    }
-
-    const wanted = await lookUpTiles(onlineSource, points, missing, limit, results, online);
+    const wanted = await lookUpCells(points, missing, results, online);
     if (!online) {
         return results;
     }
@@ -639,12 +577,12 @@ export async function getElevations(points, { online = true, onlineLimit = DEFAU
 
     missing = unanswered();
     if (missing.length) {
-        await lookUpOpenTopo('aster30m', ElevationSource.ASTER_FALLBACK, points, missing, limit, results);
+        await lookUpAster(points, missing, Math.max(2, Math.floor(onlineLimit)), results);
     }
     return results;
 }
 
-/* Elevation of one point: { elevation: number | null, source, coarse? }. */
+/* Elevation of one point: { elevation: number | null, source, file?, coarse? }. */
 export async function getElevation(lat, lon, options) {
     const [result] = await getElevations([{ lat, lon }], options);
     return result;

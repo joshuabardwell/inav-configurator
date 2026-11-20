@@ -19,6 +19,7 @@ import {
     terHeightFromTile,
     terTileDimensions,
     terTileName,
+    terrainCellOfFilename,
     terrainDatFilename,
     terrainPackerSelfTest
 } from '../js/terrain_ter.js';
@@ -42,6 +43,19 @@ describe('.TER writer', () => {
         assert.equal(terrainDatFilename(47, 8), 'N47E008.TER');
         assert.equal(terrainDatFilename(-34, -71), 'S34W071.TER');
         assert.equal(terrainDatFilename(0, 0), 'N00E000.TER');
+    });
+
+    test('a tile name gives its cell back; anything else gives null', () => {
+        for (const cell of [{ lat: 47, lon: 8 }, { lat: -34, lon: -71 }, { lat: 0, lon: 0 }, { lat: -1, lon: -180 }, { lat: 89, lon: 179 }]) {
+            assert.deepEqual(terrainCellOfFilename(terrainDatFilename(cell.lat, cell.lon)), cell);
+        }
+        assert.deepEqual(terrainCellOfFilename('n47e008.ter'), { lat: 47, lon: 8 });
+        assert.deepEqual(terrainCellOfFilename('S00W000.TER'), { lat: 0, lon: 0 });
+        assert.equal(terrainCellOfFilename('N47E008.DAT'), null);
+        assert.equal(terrainCellOfFilename('N47E008.TER.part'), null);
+        assert.equal(terrainCellOfFilename('N90E008.TER'), null);
+        assert.equal(terrainCellOfFilename('N47E180.TER'), null);
+        assert.equal(terrainCellOfFilename('TERINDEX.TXT'), null);
     });
 
     test('a 47 degree tile has the expected layout', () => {
