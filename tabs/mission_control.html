@@ -249,6 +249,23 @@
                             <div id="MPterrainFolderPath" class="mpTerrainFolderPath"></div>
                             <div id="MPterrainFolderStatus" class="mpTerrainFolderStatus"></div>
                         </div>
+                        <div class="point">
+                            <label class="point-label" for="MPelevationSource" data-i18n="missionElevationSourceSetting"></label>
+                            <select id="MPelevationSource">
+                                <option value="copernicus" data-i18n="missionElevationSourceOptCopernicus"></option>
+                                <option value="srtm" data-i18n="missionElevationSourceOptSrtm"></option>
+                                <option value="aster" data-i18n="missionElevationSourceOptAster"></option>
+                            </select>
+                            <div id="MPelevationSourceNote" class="mpTerrainFolderPath"></div>
+                        </div>
+                        <div class="point" id="MPtileDownloadRow" style="display: none">
+                            <label class="point-label" for="MPtileDownload" data-i18n="missionTileDownloadSetting"></label>
+                            <select id="MPtileDownload">
+                                <option value="ask" data-i18n="missionTileDownloadOptAsk"></option>
+                                <option value="always" data-i18n="missionTileDownloadOptAlways"></option>
+                                <option value="never" data-i18n="missionTileDownloadOptNever"></option>
+                            </select>
+                        </div>
                     </div>
                 </div>
 
@@ -322,7 +339,7 @@
                                         </td>
                                         <td><input type="number" class="home-lat" /></td>
                                         <td><input type="number" class="home-lon" /></td>
-                                        <td><span id="elevationValueAtHome">N/A</span></td>
+                                        <td><span id="elevationValueAtHome">N/A</span> <span id="elevationSourceAtHome" class="elevationSource"></span></td>
                                     </tr>
                                 </tbody>
                             </table>
@@ -853,6 +870,32 @@
                 </div>
                 <div class="modal__buttons">
                     <a id="landSpeedNotUpdatedOk" class="modal__button modal__button--main" data-i18n="OK"></a>
+                </div>
+            </div>
+            <div id="terrainTileDialogContent" class="is-hidden">
+                <div class="modal__content">
+                    <div class="modal__text" id="terrainTileDialogText"></div>
+                    <div class="modal__text" id="terrainTileDialogList"></div>
+                    <div class="modal__text" data-i18n="missionTileDialogWhy"></div>
+                    <div class="modal__text" id="terrainTileDialogProgress"></div>
+                    <div class="modal__text">
+                        <label><input type="checkbox" id="terrainTileDialogRemember"> <span data-i18n="missionTileDialogRemember"></span></label>
+                    </div>
+                </div>
+                <div class="modal__buttons">
+                    <a id="terrainTileDialogDownload" class="modal__button modal__button--main" data-i18n="missionTileDialogDownload"></a>
+                    <a id="terrainTileDialogSkip" class="modal__button" data-i18n="missionTileDialogSkip"></a>
+                </div>
+            </div>
+            <div id="terrainWebNoticeContent" class="is-hidden">
+                <div class="modal__content">
+                    <div class="modal__text" data-i18n="missionWebElevationNotice"></div>
+                    <div class="modal__text">
+                        <label><input type="checkbox" id="terrainWebNoticeHide"> <span data-i18n="missionWebElevationNoticeHide"></span></label>
+                    </div>
+                </div>
+                <div class="modal__buttons">
+                    <a id="terrainWebNoticeOk" class="modal__button modal__button--main" data-i18n="OK"></a>
                 </div>
             </div>
         </div>

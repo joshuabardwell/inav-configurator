@@ -10,6 +10,10 @@ import jBox from 'jbox';
 import GUI, { TABS } from './../js/gui';
 import i18n from './../js/localization';
 import store from './../js/store';
+import {
+    offlineFolderAvailable, offlineFolderDefaultDir, offlineFolderDir, offlineFolderPath,
+    offlineFolderRead, offlineFolderWrite
+} from './../js/offline_folder.js';
 import { globalSettings, UnitType } from './../js/globalSettings';
 import JSZip from 'jszip';
 import { terrainDatFilename } from './../js/terrain_ter.js';
@@ -452,32 +456,27 @@ const hgtDb = {
 // file system, so there the folder is unavailable and generation works as before.
 const offlineStore = {
     available() {
-        return !globalThis.__INAV_BROWSER_BUILD__ && typeof globalThis.electronAPI?.downloadToFile === 'function';
+        return offlineFolderAvailable();
     },
 
     defaultDir() {
-        return globalThis.electronAPI.appGetPath('userData') + '/offline_terrain';
+        return offlineFolderDefaultDir();
     },
 
     dir() {
-        return store.get('mapgen_offline_dir', '') || this.defaultDir();
+        return offlineFolderDir();
     },
 
     path(rel) {
-        return this.dir() + '/' + rel;
+        return offlineFolderPath(rel);
     },
 
-    async read(rel) {
-        if (!this.available()) return null;
-        const r = await globalThis.electronAPI.readFile(this.path(rel), null);
-        if (!r || r.error || !r.data) return null;
-        return r.data instanceof Uint8Array ? r.data : new Uint8Array(r.data);
+    read(rel) {
+        return offlineFolderRead(rel);
     },
 
-    async write(rel, bytes) {
-        if (!this.available()) return;
-        const err = await globalThis.electronAPI.writeFileAtomic(this.path(rel), bytes);
-        if (err) throw new Error(err);
+    write(rel, bytes) {
+        return offlineFolderWrite(rel, bytes);
     },
 
     // File names present in elevation/<source>/.
