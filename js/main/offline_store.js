@@ -4,7 +4,7 @@
 // imports: tests/offline-store.test.mjs runs it under plain node.
 
 import { createWriteStream } from 'node:fs';
-import { mkdir, rename, rm, stat, statfs, readdir, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, rename, rm, stat, statfs, readdir, writeFile } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
@@ -76,6 +76,36 @@ export async function writeFileAtomic(dest, data) {
         return false;
     } catch (err) {
         await rm(part, { force: true }).catch(() => {});
+        return String(err?.message || err);
+    }
+}
+
+// Copies src to dest through dest.part, like writeFileAtomic. Used to put .TER
+// files from the terrain folder onto an SD card without passing 40 MB through
+// the renderer. Returns false on success, else the error message.
+export async function copyFileAtomic(src, dest) {
+    const part = dest + '.part';
+    try {
+        await mkdir(path.dirname(dest), { recursive: true });
+        await copyFile(src, part);
+        await rename(part, dest);
+        return false;
+    } catch (err) {
+        await rm(part, { force: true }).catch(() => {});
+        return String(err?.message || err);
+    }
+}
+
+// Makes sure dir exists and is a folder. Returns false on success, else the
+// error message. The caller hands dir to the system's file manager, which
+// would run a file instead of showing it, so anything but a folder is refused.
+export async function ensureFolder(dir) {
+    if (typeof dir !== 'string' || !path.isAbsolute(dir)) return 'not an absolute path';
+    try {
+        await mkdir(dir, { recursive: true });
+        const s = await stat(dir);
+        return s.isDirectory() ? false : 'not a folder';
+    } catch (err) {
         return String(err?.message || err);
     }
 }

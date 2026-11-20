@@ -1,17 +1,16 @@
-// Elevation sources for the Map Generator's terrain (.TER) output: NASA SRTM
-// (.hgt.gz from the AWS "skadi" bucket) and Copernicus GLO-30 (Cloud-Optimized
-// GeoTIFF). Both are turned into the same 3601x3601 big-endian int16 grid per
-// 1° cell, which createDatFromHgt() converts into a .TER file.
+// Elevation sources for terrain files (.TER): Copernicus GLO-30 (Cloud-Optimized
+// GeoTIFF) and NASA SRTM (.hgt.gz from the AWS "skadi" bucket). Both are turned
+// into the same 3601x3601 big-endian int16 grid per 1° cell, which
+// createDatFromHgt() converts into a .TER file. js/terrain_build.js picks the
+// source per cell and drives this.
 //
-// Moved out of tabs/map_generator.js so it runs without the DOM: the tab and
-// tools/test_offline_terrain.mjs both use it. All storage goes through an `io`
-// object, every member optional:
-//   io.hgtDb     { get(key), put(key, buffer) }   decoded grids (IndexedDB in the tab)
-//   io.readLocal(relPath) -> Uint8Array | null    the offline data folder
-//   io.saveLocal(relPath, bytes)                  keeps what was downloaded in that folder
+// DOM-free. Everything is downloaded into memory and nothing is kept: the only
+// thing written to disk is the finished .TER, by js/terrain_library.js. The
+// loaders take an `io` object, every member optional:
 //   io.hasFile(source, lat, lon) -> true | false | null
 //                                                 bundled cell index; false = the source
 //                                                 has no file for that cell (sea)
+//   io.signal    AbortSignal                      stops the downloads of a build
 // Network access uses globalThis.fetch (geotiff's range reads use it too).
 
 import { fromUrl, fromArrayBuffer } from 'geotiff';
@@ -20,12 +19,12 @@ import {
     addOffset, eastBlocks, buildTerBlock, terrainPackerSelfTest
 } from './terrain_ter.js';
 
-// A cell that has data (per the index or the server) could not be read from the
-// offline folder or downloaded. Generation must stop: carrying on would write a
-// .TER that claims sea level where there is land.
+// A cell that has data (per the index or the server) could not be downloaded.
+// The build of that file must stop: carrying on would write a .TER that claims
+// sea level where there is land.
 export class MissingElevationError extends Error {
     constructor(cellName, cause) {
-        super(`${cellName} needs elevation data that is not in the offline folder and could not be downloaded` +
+        super(`${cellName} needs elevation data that could not be downloaded` +
             (cause?.message ? ` (${cause.message})` : ''));
         this.name = 'MissingElevationError';
         this.cellName = cellName;
@@ -37,28 +36,8 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function toArrayBuffer(bytes) {
-    if (bytes instanceof ArrayBuffer) return bytes;
-    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-}
-
-async function saveLocal(io, relPath, bytes) {
-    if (!io?.saveLocal) return;
-    try {
-        await io.saveLocal(relPath, bytes);
-    } catch (e) {
-        console.warn('Could not keep ' + relPath + ' in the offline folder:', e?.message || e);
-    }
-}
-
-async function readLocal(io, relPath) {
-    if (!io?.readLocal) return null;
-    try {
-        const bytes = await io.readLocal(relPath);
-        return bytes && bytes.byteLength > 0 ? bytes : null;
-    } catch (_) {
-        return null;
-    }
+function isAbort(error) {
+    return error?.name === 'AbortError';
 }
 
 // ─── Elevation grid → .TER conversion engine ──────────────────────────────────
@@ -118,11 +97,6 @@ export function srtmUrl(lat, lon) {
     return SRTM_BASE_URL + '/' + name.substring(0, 3) + '/' + name + '.hgt.gz';
 }
 
-// Where each source's original file sits inside the offline data folder.
-export function srtmLocalPath(lat, lon) {
-    return 'elevation/srtm/' + srtmTileName(lat, lon) + '.hgt.gz';
-}
-
 export function estimateDatSizeMB(lat) {
     const baseLat = Math.floor(Math.abs(lat)) * (lat >= 0 ? 1 : -1) * 10000000;
     const baseLon = 0;
@@ -176,29 +150,13 @@ export async function decompressGz(arrayBuffer) {
     return data;
 }
 
-// One SRTM grid, from memory, the decoded-grid cache, the offline folder or
-// the server, in that order. Returns null for a cell with no file (sea): the
-// index says so, or the server answers 404. Throws MissingElevationError when
-// the data exists but can't be read or downloaded.
+// One SRTM grid, from memory or the server. Returns null for a cell with no
+// file (sea): the index says so, or the server answers 404. Throws
+// MissingElevationError when the data exists but can't be downloaded.
 async function loadSrtmGrid(lat, lon, runCache, io, statusCb) {
     const key = lat + '_' + lon;
     if (Object.hasOwn(runCache, key)) return runCache[key];
     const name = srtmTileName(lat, lon);
-
-    const cachedBuf = io?.hgtDb ? await io.hgtDb.get(key) : null;
-    if (cachedBuf) {
-        runCache[key] = makeHgtView(new Uint8Array(cachedBuf));
-        if (statusCb) statusCb('cached');
-        return runCache[key];
-    }
-
-    const local = await readLocal(io, srtmLocalPath(lat, lon));
-    if (local) {
-        if (statusCb) statusCb('decompressing');
-        runCache[key] = makeHgtView(await decompressGz(local));
-        if (statusCb) statusCb('local');
-        return runCache[key];
-    }
 
     if (io?.hasFile && io.hasFile('srtm', lat, lon) === false) {
         runCache[key] = null;
@@ -208,7 +166,7 @@ async function loadSrtmGrid(lat, lon, runCache, io, statusCb) {
     if (statusCb) statusCb('connecting');
     let gz;
     try {
-        const resp = await fetch(srtmUrl(lat, lon));
+        const resp = await fetch(srtmUrl(lat, lon), { signal: io?.signal });
         if (resp.status === 404) {
             runCache[key] = null;
             return null;
@@ -217,12 +175,11 @@ async function loadSrtmGrid(lat, lon, runCache, io, statusCb) {
         if (statusCb) statusCb('downloading');
         gz = new Uint8Array(await resp.arrayBuffer());
     } catch (e) {
+        if (isAbort(e)) throw e;
         throw new MissingElevationError(name, e);
     }
-    await saveLocal(io, srtmLocalPath(lat, lon), gz);
     if (statusCb) statusCb('decompressing');
     const hgtData = await decompressGz(gz);
-    if (io?.hgtDb) void io.hgtDb.put(key, hgtData.buffer || hgtData);   // fire-and-forget, as before
     runCache[key] = makeHgtView(hgtData);
     if (statusCb) statusCb('downloaded', hgtData.length);
     return runCache[key];
@@ -264,10 +221,10 @@ export const COPERNICUS_NOTICE_1 = 'produced using Copernicus WorldDEM-30 © DLR
 export const COPERNICUS_NOTICE_2 = 'The organisations in charge of the Copernicus programme by law or by delegation do not incur any liability for any use of the Copernicus WorldDEM-30';
 export const TERRAIN_ATTR_SRTM = 'Elevation data: <a href="https://www.usgs.gov/centers/eros/science/usgs-eros-archive-digital-elevation-shuttle-radar-topography-mission-srtm-1">NASA SRTM</a>';
 export const TERRAIN_ATTR_COPERNICUS = 'Elevation data: <a href="https://registry.opendata.aws/copernicus-dem/">Copernicus WorldDEM-30</a>';
-// Shipped inside the exported ZIP. The WorldDEM-30 licence (Art. 6) ties the
-// notices to distribution / communication to the public, so the ZIP — the
-// artefact a user can pass on — carries them, while a direct write to the
-// user's own flight controller SD card (personal use) does not.
+// Kept next to the terrain files (NOTICE.TXT in the terrain folder) and shipped
+// inside the exported ZIP. The WorldDEM-30 licence (Art. 6) ties the notices to
+// distribution / communication to the public, so they travel with the files a
+// user can pass on.
 export function copernicusNoticeText() {
     return 'INAV Terrain elevation data — attribution notice\r\n\r\n' +
         'Elevation source: Copernicus WorldDEM-30 (GLO-30), 30 m\r\n' +
@@ -283,9 +240,7 @@ export function copernicusNoticeText() {
 export const COPERNICUS_GRID = 3600;
 const COPERNICUS_ROW_BAND = 600;      // rows decoded per step, to cap peak memory
 const COPERNICUS_MAX_RETRIES = 2;
-// Grids cached under the old 'cop_' prefix were built assuming every tile is
-// 3600 px wide and are wrong at |lat| >= 50° — never reuse them.
-export const COPERNICUS_CACHE_PREFIX = 'cop2_';
+const REMOTE_READ_CACHE = { blockSize: 65536, cacheSize: 256 };   // up to 16 MB per open tile
 
 // Sampling plan for mapping 3600-grid columns [colFrom..colTo] onto a tile
 // that is `width` px wide: each grid column sits at source position
@@ -336,10 +291,6 @@ export function copernicusUrl(lat, lon) {
     return `${COPERNICUS_BASE_URL}/${stem}/${stem}.tif`;
 }
 
-export function copernicusLocalPath(lat, lon) {
-    return 'elevation/copernicus/' + copernicusTileStem(lat, lon) + '.tif';
-}
-
 // Polite retry: back off on transient errors (503 throttling), give up on 404
 // (a tile that simply does not exist — ocean or outside coverage).
 async function copernicusRetry(fn) {
@@ -349,30 +300,22 @@ async function copernicusRetry(fn) {
         try {
             return await fn();
         } catch (e) {
-            if (e?.notFound) throw e;
+            if (e?.notFound || isAbort(e)) throw e;
             lastErr = e;
         }
     }
     throw lastErr || new Error('Copernicus request failed');
 }
 
-// Opens one Copernicus tile. A copy in the offline folder wins and is read
-// whole. Otherwise `full` downloads the whole GeoTIFF in a single request (used
-// for the tile being generated, and kept in the offline folder); without it the
-// file is read remotely with HTTP range requests, so a thin neighbour strip only
-// pulls the blocks it touches. Returns null when the tile does not exist.
+// Opens one Copernicus tile. `full` downloads the whole GeoTIFF in a single
+// request (used for the cell being built); without it the file is read remotely
+// with HTTP range requests, so a thin neighbour strip only pulls the blocks it
+// touches. A tile already downloaded whole in this run (imgCache) is reused for
+// either. Returns null when the tile does not exist.
 async function openCopernicusImage(lat, lon, imgCache, full, statusCb, io) {
     const key = lat + '_' + lon;
     if (Object.hasOwn(imgCache, key) && (imgCache[key] === null || imgCache[key].full || !full)) {
         return imgCache[key] ? imgCache[key].image : null;
-    }
-    const local = await readLocal(io, copernicusLocalPath(lat, lon));
-    if (local) {
-        if (statusCb) statusCb('decoding', local.byteLength);
-        const tiff = await fromArrayBuffer(toArrayBuffer(local));
-        const entry = { image: await tiff.getImage(), full: true };
-        imgCache[key] = entry;
-        return entry.image;
     }
     if (io?.hasFile && io.hasFile('copernicus', lat, lon) === false) {
         imgCache[key] = null;
@@ -382,7 +325,7 @@ async function openCopernicusImage(lat, lon, imgCache, full, statusCb, io) {
         const entry = await copernicusRetry(async () => {
             if (full) {
                 if (statusCb) statusCb('downloading');
-                const resp = await fetch(copernicusUrl(lat, lon));
+                const resp = await fetch(copernicusUrl(lat, lon), { signal: io?.signal });
                 if (resp.status === 404) {           // no file = square is entirely sea
                     const err = new Error('HTTP 404');
                     err.notFound = true;
@@ -390,21 +333,23 @@ async function openCopernicusImage(lat, lon, imgCache, full, statusCb, io) {
                 }
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
                 const buf = await resp.arrayBuffer();
-                await saveLocal(io, copernicusLocalPath(lat, lon), new Uint8Array(buf));
                 if (statusCb) statusCb('decoding', buf.byteLength);
                 const tiff = await fromArrayBuffer(buf);
                 return { image: await tiff.getImage(), full: true };
             }
             try {
-                const tiff = await fromUrl(copernicusUrl(lat, lon));
+                // Without a block size geotiff keeps nothing: every strip read
+                // fetches its blocks again (measured: 28.6 MB for one east strip,
+                // 8.7 MB with the cache).
+                const tiff = await fromUrl(copernicusUrl(lat, lon), REMOTE_READ_CACHE, io?.signal);
                 return { image: await tiff.getImage(), full: false };
             } catch (e) {
+                if (isAbort(e)) throw e;
                 // geotiff throws a generic error with no status. Confirm with a
                 // HEAD: this bucket returns 404 for 1° squares that are entirely
                 // sea (no file) — that is "no data", so the edge stays at sea
                 // level. A 403 or anything else is a real access/network problem
-                // and must surface (→ ask-first SRTM fallback), not be silently
-                // zeroed into the terrain.
+                // and must surface, not be silently zeroed into the terrain.
                 const head = await fetch(copernicusUrl(lat, lon), { method: 'HEAD' });
                 if (head.status === 404) {
                     const err = new Error('HTTP 404');
@@ -418,7 +363,8 @@ async function openCopernicusImage(lat, lon, imgCache, full, statusCb, io) {
         return entry.image;
     } catch (e) {
         // Missing tile is "no data", not a failure — but a network/server
-        // problem must surface so the user can decide about the fallback.
+        // problem must surface: the file is not built.
+        if (isAbort(e)) throw e;
         if (!e?.notFound) throw new MissingElevationError(copernicusTileStem(lat, lon), e);
         imgCache[key] = null;
         return null;
@@ -534,18 +480,14 @@ function copernicusEastMarginCols(degLat) {
 }
 
 // Returns the tile cache createDatFromHgt() needs for one 1° cell: a full grid
-// for the cell itself plus N/E/NE edge data. A neighbour comes from memory or
-// the decoded-grid cache as a full grid when one is there; otherwise only its
-// strip is built (from the offline folder, or by range reads). Partial strips
-// live in a per-cell object and are never written to runCache or IndexedDB — a
-// strip sits in a zero-filled full-size buffer, so reusing one as a complete
-// grid would look like an ocean tile.
+// for the cell itself plus N/E/NE edge data. A neighbour comes from runCache as
+// a full grid when one is there; otherwise only its strip is built (by range
+// reads, or from a tile imgCache holds whole). Partial strips live in a per-cell
+// object and are never written to runCache — a strip sits in a zero-filled
+// full-size buffer, so reusing one as a complete grid would look like an ocean
+// tile.
 export async function ensureCopernicusCellData(degLat, degLon, runCache, imgCache, statusCb, io) {
     const primaryKey = degLat + '_' + degLon;
-    if (!runCache[primaryKey] && io?.hgtDb) {
-        const cachedBuf = await io.hgtDb.get(COPERNICUS_CACHE_PREFIX + primaryKey);
-        if (cachedBuf) runCache[primaryKey] = makeHgtView(new Uint8Array(cachedBuf));
-    }
 
     const cellCache = {};
     if (runCache[primaryKey]) cellCache[primaryKey] = runCache[primaryKey];
@@ -556,7 +498,6 @@ export async function ensureCopernicusCellData(degLat, degLon, runCache, imgCach
         if (!grid) return null;
         runCache[primaryKey] = grid;
         cellCache[primaryKey] = grid;
-        if (io?.hgtDb) void io.hgtDb.put(COPERNICUS_CACHE_PREFIX + primaryKey, grid.buffer);   // fire-and-forget by design
     }
 
     const rowStart = COPERNICUS_GRID - copernicusNorthMarginRows();
@@ -570,10 +511,6 @@ export async function ensureCopernicusCellData(degLat, degLon, runCache, imgCach
     for (const nb of neighbors) {
         if (nb.lat > 89) continue;
         const key = nb.lat + '_' + nb.lon;
-        if (!runCache[key] && io?.hgtDb) {
-            const cachedBuf = await io.hgtDb.get(COPERNICUS_CACHE_PREFIX + key);
-            if (cachedBuf) runCache[key] = makeHgtView(new Uint8Array(cachedBuf));
-        }
         if (runCache[key]) { cellCache[key] = runCache[key]; continue; }
         if (statusCb) statusCb('edges');
         const strip = await buildCopernicusGrid(nb.lat, nb.lon, nb.rowFrom, nb.rowTo, nb.colFrom, nb.colTo,

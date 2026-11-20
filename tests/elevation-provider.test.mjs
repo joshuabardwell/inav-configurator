@@ -1,20 +1,20 @@
 import assert from 'node:assert/strict';
-import { beforeEach, describe, test } from 'node:test';
+import { describe, test } from 'node:test';
 
 import {
     ElevationSource,
-    OnlineSource,
     TileDownload,
+    buildTiles,
+    canBuildTiles,
     configureElevationProvider,
     declineTiles,
-    downloadTiles,
+    forgetTerFiles,
     forgetTileQuestions,
     elevationSourceStatus,
     getElevation,
     getElevations,
+    getTerFolder,
     isLocalTerrainActive,
-    setOnlineSource,
-    setTerFolder,
     setTileDownload,
     setTileWantedListener,
     summariseSources
@@ -33,56 +33,62 @@ function hills(latDeg, lonDeg) {
 
 // First two block rows of N47E008: about 1.4 km north of the 47th parallel.
 const tile = createTerTile(47, 8, hills, { wantBlock: (ix) => ix < 2 });
+const flatTile = createTerTile(47, 8, () => 900, { wantBlock: (ix) => ix < 2 });
 
 function pointInTile(north, east) {
     const [lat, lon] = addOffset(47e7, 8e7, north * TERRAIN_SPACING, east * TERRAIN_SPACING);
     return { lat: lat * 1e-7, lon: lon * 1e-7 };
 }
 
-// Fake file system holding one tile, and a fake online service that answers
-// 1000 + latitude index so tests can tell the two sources apart.
+function asterService(log, fails = false) {
+    return async (url) => {
+        log.urls.push(url);
+        if (fails) throw new Error('offline');
+        const locations = url.split('locations=')[1].split('|');
+        return {
+            json: async () => ({
+                status: 'OK',
+                results: locations.map(location => ({ elevation: 1000 + Number(location.split(',')[0]) }))
+            })
+        };
+    };
+}
+
+// A terrain folder holding one file, and a fake ASTER service that answers
+// 1000 + latitude so tests can tell the two sources apart. Every cell counts as
+// land Copernicus leaves out, so points outside the file go straight to ASTER.
 function harness({ folder = 'X:/sd', onlineFails = false } = {}) {
-    const log = { reads: [], exists: [], urls: [] };
+    const log = { reads: [], exists: [], urls: [], folder, files: new Set(['X:/sd/N47E008.TER']) };
     configureElevationProvider({
         pathExists: async (path) => {
             log.exists.push(path);
-            return path === 'X:/sd/N47E008.TER';
+            return log.files.has(path);
         },
         readFileRanges: async (path, ranges) => {
             log.reads.push({ path, ranges });
             return { error: false, data: ranges.map(([offset, length]) => tile.slice(offset, offset + length)) };
         },
-        fetchOnline: async (url) => {
-            log.urls.push(url);
-            if (onlineFails) throw new Error('offline');
-            const locations = url.split('locations=')[1].split('|');
-            return {
-                json: async () => ({
-                    status: 'OK',
-                    results: locations.map(location => ({ elevation: 1000 + Number(location.split(',')[0]) }))
-                })
-            };
-        }
+        fetchOnline: asterService(log, onlineFails),
+        terFolder: () => log.folder,
+        canBuild: () => false,
+        onTerrainChange: () => () => {},
+        cellInfo: () => ({ source: 'srtm', downloadBytes: 1, terBytes: 2 })
     });
-    setTerFolder(folder);
-    setOnlineSource(OnlineSource.ASTER);
     return log;
 }
 
 describe('elevation provider: terrain folder and ASTER', () => {
-    beforeEach(() => {
-        setTerFolder(null);
-    });
-
-    test('answers from the terrain folder and says so', async () => {
+    test('answers from the terrain folder and says which file', async () => {
         const log = harness();
         const point = pointInTile(10.5, 300.5);
         const result = await getElevation(point.lat, point.lon);
 
         assert.equal(result.source, ElevationSource.TER);
+        assert.equal(result.file, 'N47E008.TER');
         assert.ok(Math.abs(result.elevation - hills(point.lat, point.lon)) <= 3, `got ${result.elevation}`);
-        assert.equal(log.urls.length, 0, 'no online request when the tile has the point');
+        assert.equal(log.urls.length, 0, 'no online request when the file has the point');
         assert.deepEqual(elevationSourceStatus().tilesUsed, ['N47E008.TER']);
+        assert.equal(getTerFolder(), 'X:/sd');
     });
 
     test('reads only the blocks it needs, once', async () => {
@@ -90,36 +96,36 @@ describe('elevation provider: terrain folder and ASTER', () => {
         const points = [pointInTile(3.5, 5.5), pointInTile(4.5, 6.5), pointInTile(5.5, 7.5 + 5 * TERRAIN_BLK_SPACE_Y)];
         await getElevations(points);
 
-        assert.equal(log.reads.length, 1, 'one read call for the tile');
+        assert.equal(log.reads.length, 1, 'one read call for the file');
         assert.equal(log.reads[0].ranges.length, 2, 'two distinct blocks');
         for (const [, length] of log.reads[0].ranges) {
             assert.ok(length < 2048, 'a block read is smaller than its 2048-byte slot');
         }
-        assert.equal(log.exists.length, 1, 'tile existence is checked once');
+        assert.equal(log.exists.length, 1, 'file existence is checked once');
 
         await getElevations(points);
         assert.equal(log.reads.length, 1, 'second lookup is served from memory');
     });
 
-    test('falls back to the online source where the folder has no tile', async () => {
+    test('falls back to ASTER where the folder has no file', async () => {
         const log = harness();
         const inTile = pointInTile(10.5, 300.5);
         const results = await getElevations([inTile, { lat: 51.5, lon: -0.1 }]);
 
         assert.equal(results[0].source, ElevationSource.TER);
-        assert.equal(results[1].source, ElevationSource.ASTER);
-        assert.equal(results[1].elevation, 1051.5);
+        assert.deepEqual(results[1], { elevation: 1051.5, source: ElevationSource.ASTER });
         assert.equal(log.urls.length, 1);
-        assert.ok(log.urls[0].endsWith('locations=51.50000,-0.10000'), log.urls[0]);
+        assert.ok(log.urls[0].endsWith('/aster30m?locations=51.50000,-0.10000'), log.urls[0]);
         assert.deepEqual(elevationSourceStatus().tilesMissing, ['N51W001.TER']);
         assert.equal(summariseSources(results).overall, 'mixed');
     });
 
-    test('falls back to online for a part of the tile that was never written', async () => {
+    test('falls back for a part of the file that was never written', async () => {
         harness();
         const beyond = pointInTile(5 * TERRAIN_BLK_SPACE_X + 4.5, 20.5);
         const result = await getElevation(beyond.lat, beyond.lon);
         assert.equal(result.source, ElevationSource.ASTER);
+        assert.equal(result.file, undefined);
     });
 
     test('reports no data when neither source answers', async () => {
@@ -135,7 +141,7 @@ describe('elevation provider: terrain folder and ASTER', () => {
         assert.equal(log.urls.length, 0);
     });
 
-    test('without a folder everything comes from the online source', async () => {
+    test('without a folder everything comes from online', async () => {
         const log = harness({ folder: null });
         assert.equal(isLocalTerrainActive(), false);
         const point = pointInTile(10.5, 300.5);
@@ -145,7 +151,7 @@ describe('elevation provider: terrain folder and ASTER', () => {
         assert.equal(log.exists.length, 0);
     });
 
-    test('batches online lookups at 100 locations per request and remembers answers', async () => {
+    test('batches ASTER lookups at 100 locations per request and remembers answers', async () => {
         const log = harness({ folder: null });
         const points = Array.from({ length: 250 }, (_, i) => ({ lat: 50 + i * 0.001, lon: 1 }));
         const results = await getElevations(points, { onlineLimit: 300 });
@@ -158,7 +164,7 @@ describe('elevation provider: terrain folder and ASTER', () => {
         assert.equal(log.urls.length, 3, 'repeat lookups are served from memory');
     });
 
-    test('thins a long list out instead of flooding the online source', async () => {
+    test('thins a long list out instead of flooding ASTER', async () => {
         const log = harness({ folder: null });
         const points = Array.from({ length: 500 }, (_, i) => ({ lat: 50 + i * 0.001, lon: 1 }));
         const results = await getElevations(points);
@@ -181,12 +187,23 @@ describe('elevation provider: terrain folder and ASTER', () => {
         const log = harness();
         const point = pointInTile(10.5, 300.5);
         await getElevation(point.lat, point.lon);
-        setTerFolder('Y:/other');
+        log.folder = 'Y:/other';
         const result = await getElevation(point.lat, point.lon);
 
         assert.equal(result.source, ElevationSource.ASTER);
         assert.deepEqual(elevationSourceStatus().tilesMissing, ['N47E008.TER']);
         assert.ok(log.exists.includes('Y:/other/N47E008.TER'));
+    });
+
+    test('a file copied into the folder is found after forgetTerFiles', async () => {
+        const log = harness();
+        log.files.clear();
+        const point = pointInTile(10.5, 300.5);
+        assert.equal((await getElevation(point.lat, point.lon)).source, ElevationSource.ASTER);
+        log.files.add('X:/sd/N47E008.TER');
+        assert.equal((await getElevation(point.lat, point.lon)).source, ElevationSource.ASTER, 'still remembered as missing');
+        forgetTerFiles();
+        assert.equal((await getElevation(point.lat, point.lon)).source, ElevationSource.TER);
     });
 
     test('ignores points that are not coordinates', async () => {
@@ -197,12 +214,12 @@ describe('elevation provider: terrain folder and ASTER', () => {
     });
 });
 
-// A fake Copernicus tile and SRTM grid, a fake offline folder and fake servers.
-// Copernicus heights are 2000 + cell latitude; a saved tile answers 100 more than
-// the server, SRTM (saved) 3000 + cell latitude, opentopodata 1000 + latitude.
-function tileHarness({ saved = [], offline = true, remoteFails = false, downloadFails = false, cellBytes } = {}) {
-    const log = { urls: [], opens: [], downloads: [], exists: [] };
-    const folder = new Set(saved);
+// An empty terrain folder that files can be built into, a fake Copernicus server
+// (every tile is flat at 2000 + its latitude) and the fake ASTER service. A
+// "build" puts N47E008.TER (the hills tile above) into the folder and tells the
+// provider, as js/terrain_library.js does.
+function buildHarness({ folder = 'X:/sd', canBuild = true, remoteFails = false, buildFails = false, cellInfo } = {}) {
+    const log = { urls: [], opens: [], builds: [], reads: 0, files: new Set(), bytes: tile, pending: false, listener: null };
     const flatImage = (height) => ({
         width: 3600,
         height: 3600,
@@ -215,143 +232,156 @@ function tileHarness({ saved = [], offline = true, remoteFails = false, download
         }
     });
     let clock = 0;
+    log.land = (ter) => {       // a file is written into the folder
+        log.files.add('X:/sd/' + ter.name);
+        if (log.listener) log.listener({ type: 'file', dir: 'X:/sd', name: ter.name, lat: ter.lat, lon: ter.lon });
+    };
     configureElevationProvider({
-        localAvailable: () => false,
-        offlineAvailable: () => offline,
-        savedExists: async (relPath) => {
-            log.exists.push(relPath);
-            return folder.has(relPath);
+        pathExists: async (path) => log.files.has(path),
+        readFileRanges: async (path, ranges) => {
+            log.reads++;
+            return { error: false, data: ranges.map(([offset, length]) => log.bytes.slice(offset, offset + length)) };
         },
-        openCopernicus: async (where, lat, lon) => {
-            log.opens.push(where + ':' + lat + '_' + lon);
-            if (where === 'remote' && remoteFails) throw new Error('offline');
-            return flatImage(2000 + lat + (where === 'saved' ? 100 : 0));
+        fetchOnline: asterService(log),
+        terFolder: () => folder,
+        canBuild: () => canBuild,
+        buildPending: () => log.pending,
+        onTerrainChange: (listener) => {
+            log.listener = listener;
+            return () => { log.listener = null; };
         },
-        loadSrtmGrid: async (lat) => {
-            const bytes = new Uint8Array(3601 * 3601 * 2);
-            const view = new DataView(bytes.buffer);
-            for (let i = 0; i < 3601 * 3601; i++) {
-                view.setInt16(i * 2, i === 1800 * 3601 + 1800 ? 32767 : 3000 + lat, false);
-            }
-            return view;
+        buildTerrain: async (cells, options) => {
+            const outcome = { built: [], present: [], failed: [], aborted: false };
+            cells.forEach((cell, index) => {
+                const name = 'N' + cell.lat + 'E00' + cell.lon + '.TER';
+                log.builds.push(name);
+                if (options.onProgress) options.onProgress({ index, total: cells.length, name, cell, stage: 'downloading', done: 1, of: 2 });
+                if (buildFails) {
+                    outcome.failed.push({ name, cell, error: 'no route' });
+                } else {
+                    log.land({ name, lat: cell.lat, lon: cell.lon });
+                    outcome.built.push({ name, cell, source: 'copernicus', bytes: 1 });
+                }
+            });
+            return outcome;
         },
-        downloadFile: async (url, relPath) => {
-            log.downloads.push(relPath);
-            if (downloadFails) return { status: 'error', error: 'no route' };
-            folder.add(relPath);
-            return { status: 200, bytes: 1 };
+        openCopernicus: async (lat, lon) => {
+            log.opens.push(lat + '_' + lon);
+            if (remoteFails) throw new Error('offline');
+            return flatImage(2000 + lat);
         },
-        cellBytes: cellBytes || ((source, lat) => (source === 'copernicus' && lat < 0 ? 0 : 5000000)),
-        now: () => clock,
-        fetchOnline: async (url) => {
-            log.urls.push(url);
-            const locations = url.split('locations=')[1].split('|');
-            return {
-                json: async () => ({
-                    status: 'OK',
-                    results: locations.map(location => ({ elevation: 1000 + Number(location.split(',')[0]) }))
-                })
-            };
-        }
+        cellInfo: cellInfo || ((lat) => (lat < 0
+            ? { source: 'sea', downloadBytes: 0, terBytes: 40000000 }
+            : { source: 'copernicus', downloadBytes: 7500000, terBytes: 30000000 })),
+        now: () => clock
     });
-    setTerFolder(null);
     setTileDownload(TileDownload.ASK);
     setTileWantedListener(null);
     log.advance = (ms) => { clock += ms; };
     return log;
 }
 
-const COP_N30 = 'elevation/copernicus/Copernicus_DSM_COG_10_N30_00_W103_00_DEM.tif';
-const SRTM_N30 = 'elevation/srtm/N30W103.hgt.gz';
+const IN_FILE = pointInTile(10.5, 300.5);       // in N47E008, inside the two block rows a build writes
 
-describe('elevation provider: Copernicus', () => {
-    beforeEach(() => {
-        setOnlineSource(OnlineSource.COPERNICUS);
-    });
-
-    test('an unknown source or download setting counts as Copernicus and ask', () => {
-        setOnlineSource('nonsense');
+describe('elevation provider: cells with no terrain file', () => {
+    test('an unknown build setting counts as ask', async () => {
+        buildHarness();
         setTileDownload('nonsense');
-        const log = tileHarness();
-        assert.equal(log.urls.length, 0);
-        setOnlineSource(undefined);
-        return getElevation(30.5, -102.5).then(result => assert.equal(result.source, ElevationSource.COPERNICUS));
-    });
-
-    test('reads the server tile when the offline folder has none, and says which tile it wanted', async () => {
-        const log = tileHarness();
-        const wanted = [];
-        setTileWantedListener(tiles => wanted.push(...tiles));
-        const result = await getElevation(30.5, -102.5);
-
-        assert.deepEqual(result, { elevation: 2030, source: ElevationSource.COPERNICUS });
-        assert.deepEqual(log.opens, ['remote:30_-103']);
-        assert.equal(log.urls.length, 0, 'no opentopodata request');
-        assert.equal(wanted.length, 1);
-        assert.equal(wanted[0].name, 'Copernicus_DSM_COG_10_N30_00_W103_00_DEM');
-        assert.equal(wanted[0].bytes, 5000000);
-        assert.equal(wanted[0].source, 'copernicus');
-    });
-
-    test('asks about a tile once per session, and one call names every tile it touched', async () => {
-        tileHarness();
-        const calls = [];
-        setTileWantedListener(tiles => calls.push(tiles.map(tile => tile.lat + '_' + tile.lon)));
-        await getElevations([{ lat: 30.5, lon: -102.5 }, { lat: 31.5, lon: -102.5 }, { lat: 30.6, lon: -102.4 }]);
-        await getElevation(30.7, -102.3);
-        assert.deepEqual(calls, [['30_-103', '31_-103']]);
-    });
-
-    test('reads a tile saved in the offline folder and does not ask', async () => {
-        const log = tileHarness({ saved: [COP_N30] });
-        const wanted = [];
-        setTileWantedListener(tiles => wanted.push(...tiles));
-        const result = await getElevation(30.5, -102.5);
-
-        assert.deepEqual(result, { elevation: 2130, source: ElevationSource.COPERNICUS_SAVED });
-        assert.deepEqual(log.opens, ['saved:30_-103']);
-        assert.equal(wanted.length, 0);
-    });
-
-    test('after a download the next lookup reads the saved tile', async () => {
-        const log = tileHarness();
-        let wanted = [];
-        setTileWantedListener(tiles => { wanted = tiles; });
-        assert.equal((await getElevation(30.5, -102.5)).source, ElevationSource.COPERNICUS);
-
-        const progress = [];
-        const outcome = await downloadTiles(wanted, step => progress.push(step.done + '/' + step.total));
-        assert.equal(outcome.downloaded.length, 1);
-        assert.equal(outcome.failed.length, 0);
-        assert.deepEqual(log.downloads, [COP_N30]);
-        assert.deepEqual(progress, ['0/1', '1/1']);
-
-        const result = await getElevation(30.6, -102.4);
-        assert.deepEqual(result, { elevation: 2130, source: ElevationSource.COPERNICUS_SAVED });
-    });
-
-    test('a failed download is reported and lookups stay on the server', async () => {
-        tileHarness({ downloadFails: true });
-        let wanted = [];
-        setTileWantedListener(tiles => { wanted = tiles; });
-        await getElevation(30.5, -102.5);
-        const outcome = await downloadTiles(wanted);
-        assert.equal(outcome.failed.length, 1);
-        assert.equal(outcome.failed[0].error, 'no route');
-        assert.equal((await getElevation(30.6, -102.4)).source, ElevationSource.COPERNICUS);
-    });
-
-    test('a declined tile is not asked about again', async () => {
-        tileHarness();
         const calls = [];
         setTileWantedListener(tiles => calls.push(tiles));
-        declineTiles([{ source: 'copernicus', lat: 30, lon: -103 }]);
-        await getElevation(30.5, -102.5);
+        await getElevation(IN_FILE.lat, IN_FILE.lon);
+        assert.equal(calls.length, 1);
+        assert.ok(canBuildTiles());
+    });
+
+    test('reads the server tile and says which terrain file it wanted', async () => {
+        const log = buildHarness();
+        const wanted = [];
+        setTileWantedListener(tiles => wanted.push(...tiles));
+        const result = await getElevation(IN_FILE.lat, IN_FILE.lon);
+
+        assert.deepEqual(result, { elevation: 2047, source: ElevationSource.COPERNICUS });
+        assert.deepEqual(log.opens, ['47_8']);
+        assert.equal(log.urls.length, 0, 'no ASTER request');
+        assert.deepEqual(wanted, [{
+            key: 'N47E008.TER', name: 'N47E008.TER', lat: 47, lon: 8,
+            source: 'copernicus', downloadBytes: 7500000, terBytes: 30000000
+        }]);
+    });
+
+    test('asks about a file once per session, and one call names every file it touched', async () => {
+        buildHarness();
+        const calls = [];
+        setTileWantedListener(tiles => calls.push(tiles.map(t => t.name)));
+        await getElevations([{ lat: 30.5, lon: -102.5 }, { lat: 31.5, lon: -102.5 }, { lat: 30.6, lon: -102.4 }]);
+        await getElevation(30.7, -102.3);
+        assert.deepEqual(calls, [['N30W103.TER', 'N31W103.TER']]);
+    });
+
+    test('after a build the next lookup reads the terrain file', async () => {
+        const log = buildHarness();
+        let wanted = [];
+        setTileWantedListener(tiles => { wanted = tiles; });
+        assert.equal((await getElevation(IN_FILE.lat, IN_FILE.lon)).source, ElevationSource.COPERNICUS);
+        assert.deepEqual(elevationSourceStatus().tilesMissing, ['N47E008.TER']);
+
+        const progress = [];
+        const outcome = await buildTiles(wanted, step => progress.push(step));
+        assert.deepEqual(outcome, { built: [wanted[0]], failed: [], aborted: false });
+        assert.deepEqual(log.builds, ['N47E008.TER']);
+        assert.deepEqual(progress, [{ done: 0, total: 1, tile: wanted[0], stage: 'downloading', stageDone: 1, stageOf: 2 }]);
+
+        const result = await getElevation(IN_FILE.lat, IN_FILE.lon);
+        assert.equal(result.source, ElevationSource.TER);
+        assert.equal(result.file, 'N47E008.TER');
+        assert.ok(Math.abs(result.elevation - hills(IN_FILE.lat, IN_FILE.lon)) <= 3);
+        assert.deepEqual(elevationSourceStatus().tilesMissing, []);
+        assert.deepEqual(elevationSourceStatus().tilesUsed, ['N47E008.TER']);
+    });
+
+    test('a file that is written again replaces what was read from the old one', async () => {
+        const log = buildHarness();
+        log.land({ name: 'N47E008.TER', lat: 47, lon: 8 });
+        const before = await getElevation(IN_FILE.lat, IN_FILE.lon);
+        assert.equal(before.source, ElevationSource.TER);
+        assert.notEqual(before.elevation, 900);
+
+        log.bytes = flatTile;
+        assert.equal((await getElevation(IN_FILE.lat, IN_FILE.lon)).elevation, before.elevation, 'served from memory');
+        log.land({ name: 'N47E008.TER', lat: 47, lon: 8 });
+        assert.equal((await getElevation(IN_FILE.lat, IN_FILE.lon)).elevation, 900);
+    });
+
+    test('a file written into another folder changes nothing here', async () => {
+        const log = buildHarness();
+        await getElevation(IN_FILE.lat, IN_FILE.lon);
+        log.files.add('X:/sd/N47E008.TER');
+        log.listener({ type: 'file', dir: 'Y:/other', name: 'N47E008.TER', lat: 47, lon: 8 });
+        assert.equal((await getElevation(IN_FILE.lat, IN_FILE.lon)).source, ElevationSource.COPERNICUS);
+    });
+
+    test('a failed build is reported and lookups stay on the server', async () => {
+        buildHarness({ buildFails: true });
+        let wanted = [];
+        setTileWantedListener(tiles => { wanted = tiles; });
+        await getElevation(IN_FILE.lat, IN_FILE.lon);
+        const outcome = await buildTiles(wanted);
+        assert.deepEqual(outcome.built, []);
+        assert.deepEqual(outcome.failed, [{ tile: wanted[0], error: 'no route' }]);
+        assert.equal((await getElevation(IN_FILE.lat, IN_FILE.lon)).source, ElevationSource.COPERNICUS);
+    });
+
+    test('a declined file is not asked about again', async () => {
+        buildHarness();
+        const calls = [];
+        setTileWantedListener(tiles => calls.push(tiles));
+        declineTiles([{ lat: 47, lon: 8 }]);
+        await getElevation(IN_FILE.lat, IN_FILE.lon);
         assert.equal(calls.length, 0);
     });
 
     test('a question that was withdrawn may be asked again', async () => {
-        tileHarness();
+        buildHarness();
         const calls = [];
         setTileWantedListener(tiles => calls.push(tiles));
         await getElevation(30.5, -102.5);
@@ -362,38 +392,58 @@ describe('elevation provider: Copernicus', () => {
         assert.equal(calls.length, 2);
     });
 
-    test('"always" downloads without asking, "never" does neither', async () => {
-        let log = tileHarness();
+    test('"always" builds without asking, once; "never" does neither', async () => {
+        let log = buildHarness({ buildFails: true });
         const calls = [];
         setTileWantedListener(tiles => calls.push(tiles));
         setTileDownload(TileDownload.ALWAYS);
-        await getElevation(30.5, -102.5);
+        await getElevation(IN_FILE.lat, IN_FILE.lon);
+        await getElevation(IN_FILE.lat, IN_FILE.lon);       // the build failed: not tried again on every lookup
         await new Promise(resolve => setTimeout(resolve, 0));
-        assert.deepEqual(log.downloads, [COP_N30]);
+        assert.deepEqual(log.builds, ['N47E008.TER']);
         assert.equal(calls.length, 0);
 
-        log = tileHarness();
+        log = buildHarness();
         setTileWantedListener(tiles => calls.push(tiles));
         setTileDownload(TileDownload.NEVER);
-        await getElevation(30.5, -102.5);
-        assert.deepEqual(log.downloads, []);
+        await getElevation(IN_FILE.lat, IN_FILE.lon);
+        assert.deepEqual(log.builds, []);
         assert.equal(calls.length, 0);
     });
 
-    test('without an offline folder nothing is asked or checked', async () => {
-        const log = tileHarness({ offline: false });
+    test('nothing is asked where files cannot be built, or while one is being built', async () => {
+        buildHarness({ canBuild: false });
         const calls = [];
         setTileWantedListener(tiles => calls.push(tiles));
-        const result = await getElevation(30.5, -102.5);
-        assert.equal(result.source, ElevationSource.COPERNICUS);
+        assert.equal((await getElevation(IN_FILE.lat, IN_FILE.lon)).source, ElevationSource.COPERNICUS);
+        assert.ok(!canBuildTiles());
+
+        buildHarness({ folder: null });
+        setTileWantedListener(tiles => calls.push(tiles));
+        await getElevation(IN_FILE.lat, IN_FILE.lon);
+
+        const log = buildHarness();
+        log.pending = true;
+        setTileWantedListener(tiles => calls.push(tiles));
+        await getElevation(IN_FILE.lat, IN_FILE.lon);
         assert.equal(calls.length, 0);
-        assert.equal(log.exists.length, 0);
+    });
+
+    test('a file that is there but has no data for the point is not offered again', async () => {
+        const log = buildHarness();
+        log.land({ name: 'N47E008.TER', lat: 47, lon: 8 });
+        const calls = [];
+        setTileWantedListener(tiles => calls.push(tiles));
+        const beyond = pointInTile(5 * TERRAIN_BLK_SPACE_X + 4.5, 20.5);
+        const result = await getElevation(beyond.lat, beyond.lon);
+        assert.deepEqual(result, { elevation: 2047, source: ElevationSource.COPERNICUS });
+        assert.equal(calls.length, 0);
     });
 
     test('falls back to ASTER when the server tile cannot be read, and leaves the server alone for a minute', async () => {
-        const log = tileHarness({ remoteFails: true });
+        const log = buildHarness({ remoteFails: true });
         const result = await getElevation(30.5, -102.5);
-        assert.deepEqual(result, { elevation: 1030.5, source: ElevationSource.ASTER_FALLBACK });
+        assert.deepEqual(result, { elevation: 1030.5, source: ElevationSource.ASTER });
         assert.ok(log.urls[0].includes('/aster30m?'), log.urls[0]);
 
         await getElevation(30.6, -102.5);
@@ -403,83 +453,48 @@ describe('elevation provider: Copernicus', () => {
         assert.equal(log.opens.length, 2);
     });
 
-    test('a sea cell reads 0 m without any request; land Copernicus leaves out goes to ASTER', async () => {
-        const log = tileHarness({
-            cellBytes: (source, lat) => {
-                if (source === 'copernicus') return 0;
-                return lat === 40 ? 12000000 : 1100000;
-            }
+    test('a sea cell reads 0 m with no request; land Copernicus leaves out goes to ASTER; both can be built', async () => {
+        const log = buildHarness({
+            cellInfo: (lat) => (lat === 40
+                ? { source: 'srtm', downloadBytes: 48000000, terBytes: 31000000 }
+                : { source: 'sea', downloadBytes: 0, terBytes: 40000000 })
         });
+        const wanted = [];
+        setTileWantedListener(tiles => wanted.push(...tiles));
         const sea = await getElevation(0.5, -140.5);
         assert.deepEqual(sea, { elevation: 0, source: ElevationSource.COPERNICUS });
         assert.equal(log.urls.length, 0);
         assert.equal(log.opens.length, 0);
 
         const armenia = await getElevation(40.5, 45.5);
-        assert.deepEqual(armenia, { elevation: 1040.5, source: ElevationSource.ASTER_FALLBACK });
+        assert.deepEqual(armenia, { elevation: 1040.5, source: ElevationSource.ASTER });
+        assert.equal(log.opens.length, 0);
+        assert.deepEqual(wanted.map(t => [t.name, t.source, t.downloadBytes]),
+            [['N00W141.TER', 'sea', 0], ['N40E045.TER', 'srtm', 48000000]]);
     });
 
-    test('offline lookups use a saved tile but never the server', async () => {
-        const log = tileHarness({ saved: [COP_N30] });
-        const results = await getElevations([{ lat: 30.5, lon: -102.5 }, { lat: 31.5, lon: -102.5 }], { online: false });
-        assert.equal(results[0].source, ElevationSource.COPERNICUS_SAVED);
+    test('offline lookups read the folder and know the sea, but never ask a server', async () => {
+        const log = buildHarness();
+        log.land({ name: 'N47E008.TER', lat: 47, lon: 8 });
+        const calls = [];
+        setTileWantedListener(tiles => calls.push(tiles));
+        const results = await getElevations([IN_FILE, { lat: 31.5, lon: -102.5 }, { lat: -10.5, lon: -140.5 }], { online: false });
+        assert.equal(results[0].source, ElevationSource.TER);
         assert.equal(results[1].source, ElevationSource.NONE);
-        assert.deepEqual(log.opens, ['saved:30_-103']);
+        assert.deepEqual(results[2], { elevation: 0, source: ElevationSource.COPERNICUS });
+        assert.deepEqual(log.opens, []);
         assert.equal(log.urls.length, 0);
+        assert.equal(calls.length, 0);
     });
 
     test('a mix of sources is summarised as mixed', async () => {
-        tileHarness({ saved: [COP_N30] });
-        const results = await getElevations([{ lat: 30.5, lon: -102.5 }, { lat: 31.5, lon: -102.5 }]);
-        assert.equal(results[0].source, ElevationSource.COPERNICUS_SAVED);
+        const log = buildHarness();
+        log.land({ name: 'N47E008.TER', lat: 47, lon: 8 });
+        const results = await getElevations([IN_FILE, { lat: 31.5, lon: -102.5 }]);
+        assert.equal(results[0].source, ElevationSource.TER);
         assert.equal(results[1].source, ElevationSource.COPERNICUS);
         assert.equal(summariseSources(results).overall, 'mixed');
-        assert.equal(summariseSources([results[0]]).overall, ElevationSource.COPERNICUS_SAVED);
-    });
-});
-
-describe('elevation provider: SRTM', () => {
-    beforeEach(() => {
-        setOnlineSource(OnlineSource.SRTM);
-    });
-
-    test('uses opentopodata srtm30m when the offline folder has no tile, and asks about the tile', async () => {
-        const log = tileHarness();
-        const wanted = [];
-        setTileWantedListener(tiles => wanted.push(...tiles));
-        const result = await getElevation(30.5, -102.5);
-        assert.deepEqual(result, { elevation: 1030.5, source: ElevationSource.SRTM_ONLINE });
-        assert.ok(log.urls[0].includes('/srtm30m?'), log.urls[0]);
-        assert.equal(wanted.length, 1);
-        assert.equal(wanted[0].name, 'N30W103');
-    });
-
-    test('reads a saved tile; a spike goes to ASTER', async () => {
-        const log = tileHarness({ saved: [SRTM_N30] });
-        const good = await getElevation(30.25, -102.75);
-        assert.deepEqual(good, { elevation: 3030, source: ElevationSource.SRTM_SAVED });
-        assert.equal(log.urls.length, 0);
-
-        const spike = await getElevation(30.5, -102.5);     // node 1800,1800
-        assert.equal(spike.source, ElevationSource.ASTER_FALLBACK);
-        assert.ok(log.urls[0].includes('/aster30m?'), log.urls[0]);
-    });
-
-    test('a long path over opentopodata is thinned out and marked coarse', async () => {
-        const log = tileHarness();
-        const points = Array.from({ length: 500 }, (_, i) => ({ lat: 30.1 + i * 0.001, lon: -102.5 }));
-        const results = await getElevations(points);
-        assert.equal(log.urls.length, 1);
-        assert.equal(results.filter(result => result.coarse).length, 400);
-        assert.ok(results.every(result => result.source === ElevationSource.SRTM_ONLINE));
-    });
-
-    test('changing the source keeps answers of the two opentopodata sets apart', async () => {
-        const log = tileHarness();
-        await getElevation(30.5, -102.5);
-        setOnlineSource(OnlineSource.ASTER);
-        const result = await getElevation(30.5, -102.5);
-        assert.equal(result.source, ElevationSource.ASTER);
-        assert.equal(log.urls.length, 2);
+        assert.equal(summariseSources([results[0]]).overall, ElevationSource.TER);
+        assert.equal(summariseSources([results[1]]).overall, ElevationSource.COPERNICUS);
     });
 });

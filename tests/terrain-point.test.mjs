@@ -55,7 +55,7 @@ describe('Copernicus points', () => {
             openCopernicus: async () => fakeImage(3600, (row, x) => 100.4 + row + x * 0.001)
         });
         // row 1800, column 900 of N30W103
-        const height = await sampler.copernicusPoint('remote', 31 - 1800 / 3600, -103 + 900 / 3600);
+        const height = await sampler.copernicusPoint(31 - 1800 / 3600, -103 + 900 / 3600);
         assert.equal(height, Math.round(100.4 + 1800 + 0.9));
     });
 
@@ -65,7 +65,7 @@ describe('Copernicus points', () => {
         const lat = 31 - 100.25 / 3600;
         const lon = -103 + 200.5 / 3600;
         const expected = Math.trunc(500 + 3 * 100.25 - 2 * 200.5);
-        assert.equal(await sampler.copernicusPoint('remote', lat, lon), expected);
+        assert.equal(await sampler.copernicusPoint(lat, lon), expected);
     });
 
     test('matches hgtElevation on the same grid away from the cell edges', async () => {
@@ -74,7 +74,7 @@ describe('Copernicus points', () => {
         const view = makeHgtView(srtmGrid((r, c) => heightAt(Math.min(r, 3599), Math.min(c, 3599))));
         const cache = { '30_-103': view };
         for (const [lat, lon] of [[30.3891303, -102.9510679], [30.75, -102.25], [30.0101, -102.9899], [30.5, -102.5]]) {
-            assert.equal(await sampler.copernicusPoint('remote', lat, lon), hgtElevation(cache, 30, -103, lat, lon));
+            assert.equal(await sampler.copernicusPoint(lat, lon), hgtElevation(cache, 30, -103, lat, lon));
         }
     });
 
@@ -82,39 +82,39 @@ describe('Copernicus points', () => {
         // 2400 px wide: pixel x covers 1.5 grid columns. Height = pixel index * 10.
         const sampler = createPointSampler({ openCopernicus: async () => fakeImage(2400, (row, x) => x * 10) });
         // grid column 1800 sits at pixel 1200 exactly
-        assert.equal(await sampler.copernicusPoint('remote', 55.5, 10 + 1800 / 3600), 12000);
+        assert.equal(await sampler.copernicusPoint(55.5, 10 + 1800 / 3600), 12000);
         // grid column 1801 sits at pixel 1200.667
-        assert.equal(await sampler.copernicusPoint('remote', 55.5, 10 + 1801 / 3600), Math.round(12006.67));
+        assert.equal(await sampler.copernicusPoint(55.5, 10 + 1801 / 3600), Math.round(12006.67));
     });
 
     test('the south-most and east-most nodes come from the neighbouring tiles', async () => {
         const opened = [];
         const sampler = createPointSampler({
             // every tile is flat at 1000 + 10 * latitude + longitude of its own cell
-            openCopernicus: async (where, lat, lon, neighbour) => {
+            openCopernicus: async (lat, lon, neighbour) => {
                 opened.push(lat + '_' + lon + (neighbour ? ':neighbour' : ''));
                 return lat === 45 && lon === 10 ? null : fakeImage(3600, () => 1000 + 10 * lat + lon);
             }
         });
         // N46E008, half a step from the east edge: half this tile (1468), half N46E009 (1469)
-        assert.equal(await sampler.copernicusPoint('remote', 46.5, 9 - 0.5 / 3600), 1468);
+        assert.equal(await sampler.copernicusPoint(46.5, 9 - 0.5 / 3600), 1468);
         assert.ok(opened.includes('46_9:neighbour'));
         // half a step from the south edge: half this tile (1468), half N45E008 (1458)
-        assert.equal(await sampler.copernicusPoint('remote', 46 + 0.5 / 3600, 8.5), 1463);
+        assert.equal(await sampler.copernicusPoint(46 + 0.5 / 3600, 8.5), 1463);
         // N46E010 over a missing southern neighbour (sea): half 1470, half 0
-        assert.equal(await sampler.copernicusPoint('remote', 46 + 0.5 / 3600, 10.5), 735);
+        assert.equal(await sampler.copernicusPoint(46 + 0.5 / 3600, 10.5), 735);
         // away from the edges no neighbour is opened
         opened.length = 0;
-        await sampler.copernicusPoint('remote', 46.5, 8.5);
+        await sampler.copernicusPoint(46.5, 8.5);
         assert.deepEqual(opened, []);
     });
 
     test('below sea level clamps to 0 and a void reads 0', async () => {
         const sampler = createPointSampler({
-            openCopernicus: async (where, lat) => fakeImage(3600, () => (lat === 31 ? NaN : -80))
+            openCopernicus: async (lat) => fakeImage(3600, () => (lat === 31 ? NaN : -80))
         });
-        assert.equal(await sampler.copernicusPoint('remote', 36.25, -116.8), 0);
-        assert.equal(await sampler.copernicusPoint('remote', 31.5, 35.5), 0);
+        assert.equal(await sampler.copernicusPoint(36.25, -116.8), 0);
+        assert.equal(await sampler.copernicusPoint(31.5, 35.5), 0);
     });
 
     test('twenty simultaneous lookups open the tile once and read each block once', async () => {
@@ -129,7 +129,7 @@ describe('Copernicus points', () => {
         });
         const points = [];
         for (let n = 0; n < 20; n++) {
-            points.push(sampler.copernicusPoint('remote', 30.9 - n * 0.001, -102.9 + n * 0.001));
+            points.push(sampler.copernicusPoint(30.9 - n * 0.001, -102.9 + n * 0.001));
         }
         const heights = await Promise.all(points);
         assert.equal(opens, 1);
@@ -143,7 +143,7 @@ describe('Copernicus points', () => {
             openCopernicus: async () => fakeImage(3600, (row, x) => row + x, log),
             maxBlocks: 2
         });
-        const at = (row, col) => sampler.copernicusPoint('remote', 31 - (row + 0.5) / 3600, -103 + (col + 0.5) / 3600);
+        const at = (row, col) => sampler.copernicusPoint(31 - (row + 0.5) / 3600, -103 + (col + 0.5) / 3600);
         await at(10, 10);       // block 0,0
         await at(10, 1500);     // block 1,0
         await at(10, 2500);     // block 2,0 pushes 0,0 out
@@ -154,16 +154,16 @@ describe('Copernicus points', () => {
     test('a missing tile and a failed open both answer null, and a failure is retried', async () => {
         let attempts = 0;
         const sampler = createPointSampler({
-            openCopernicus: async (where) => {
-                if (where === 'saved') return null;
+            openCopernicus: async (lat) => {
+                if (lat === 10) return null;
                 attempts++;
                 if (attempts === 1) throw new Error('offline');
                 return fakeImage(3600, () => 250);
             }
         });
-        assert.equal(await sampler.copernicusPoint('saved', 30.5, -102.5), null);
-        assert.equal(await sampler.copernicusPoint('remote', 30.5, -102.5), null);
-        assert.equal(await sampler.copernicusPoint('remote', 30.5, -102.5), 250);
+        assert.equal(await sampler.copernicusPoint(10.5, -102.5), null);
+        assert.equal(await sampler.copernicusPoint(30.5, -102.5), null);
+        assert.equal(await sampler.copernicusPoint(30.5, -102.5), 250);
     });
 
     test('forgetTile makes the next lookup open the tile again', async () => {
@@ -174,54 +174,11 @@ describe('Copernicus points', () => {
                 return fakeImage(3600, () => 100);
             }
         });
-        await sampler.copernicusPoint('remote', 30.5, -102.5);
-        await sampler.copernicusPoint('remote', 30.6, -102.5);
+        await sampler.copernicusPoint(30.5, -102.5);
+        await sampler.copernicusPoint(30.6, -102.5);
         assert.equal(opens, 1);
         sampler.forgetTile(30, -103);
-        await sampler.copernicusPoint('remote', 30.5, -102.5);
+        await sampler.copernicusPoint(30.5, -102.5);
         assert.equal(opens, 2);
-    });
-});
-
-describe('SRTM points', () => {
-    const heightAt = (r, c) => Math.round(600 + 250 * Math.sin(r / 41) + 150 * Math.cos(c / 29));
-
-    test('matches hgtElevation', async () => {
-        const bytes = srtmGrid(heightAt);
-        const sampler = createPointSampler({ loadSrtmGrid: async () => makeHgtView(bytes) });
-        const cache = { '44_-72': makeHgtView(bytes) };
-        for (const [lat, lon] of [[44.27, -71.3], [44.999, -71.001], [44.0, -72.0], [44.5, -71.5]]) {
-            assert.equal(await sampler.srtmPoint(lat, lon), hgtElevation(cache, 44, -72, lat, lon));
-        }
-    });
-
-    test('a spike or a void next to the point answers null', async () => {
-        const bytes = srtmGrid((r, c) => {
-            if (r === 1000 && c === 1000) return 32767;
-            if (r === 2000 && c === 2000) return -32768;
-            return 300;
-        });
-        const sampler = createPointSampler({ loadSrtmGrid: async () => makeHgtView(bytes) });
-        const at = (row, col) => sampler.srtmPoint(45 - row / 3600, -72 + col / 3600);
-        assert.equal(await at(999.5, 999.5), null);
-        assert.equal(await at(2000.2, 1999.9), null);
-        assert.equal(await at(1500.5, 1500.5), 300);
-    });
-
-    test('no grid in the folder answers null, and simultaneous lookups load it once', async () => {
-        let loads = 0;
-        const bytes = srtmGrid(() => 120);
-        const sampler = createPointSampler({
-            loadSrtmGrid: async (lat) => {
-                loads++;
-                await new Promise(resolve => setTimeout(resolve, 5));
-                return lat === 44 ? makeHgtView(bytes) : null;
-            }
-        });
-        assert.equal(await sampler.srtmPoint(10.5, 10.5), null);
-        loads = 0;
-        const heights = await Promise.all(Array.from({ length: 20 }, (_, n) => sampler.srtmPoint(44.1 + n * 0.01, -71.5)));
-        assert.equal(loads, 1);
-        assert.ok(heights.every(height => height === 120));
     });
 });

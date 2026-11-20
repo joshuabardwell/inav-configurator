@@ -31,13 +31,6 @@
                             <label for="mapgen_subtarget"><span data-i18n="mapgenSubTarget">Platform</span></label>
                         </div>
 
-                        <div class="select" id="mapgen_terrain_source_wrapper" style="display:none;">
-                            <select id="mapgen_terrain_source">
-                                <option value="copernicus" selected>Copernicus GLO-30</option>
-                                <option value="srtm">NASA SRTM1 (30m)</option>
-                            </select>
-                            <label for="mapgen_terrain_source"><span data-i18n="mapgenTerrainSource">Elevation Source</span></label>
-                        </div>
                         <div id="mapgen_terrain_source_note" style="font-size:10px; color:#888; margin:2px 0 6px; line-height:1.45; display:none;"></div>
 
                         <div class="select">
@@ -91,13 +84,13 @@
                             </div>
                         </div>
                         <div id="mapgen_hint_tiles" style="font-size:10px; color:#888; margin:2px 0 4px; font-style:italic;">Hint: Each extra zoom level ≈ 4× more tiles. Keep the area small or lower max zoom (when large area selected) to avoid long syncs and rate limits.</div>
-                        <div id="mapgen_hint_terrain" style="font-size:10px; color:#888; margin:2px 0 4px; font-style:italic; display:none;">Hint: One .TER file per 1°×1° grid square (~111 km). Data: NASA SRTM1 at 30m resolution. Ocean depths are clamped to 0m.</div>
+                        <div id="mapgen_hint_terrain" style="font-size:10px; color:#888; margin:2px 0 4px; font-style:italic; display:none;">Hint: One .TER file per 1°×1° grid square (~111 km), 30m resolution. Ocean depths are clamped to 0m.</div>
 
                         <div id="mapgen_terrain_alt_row" class="checkbox mapgen-overwrite-row" style="display:none;">
                             <input type="checkbox" id="mapgen_terrain_alt_toggle" />
                             <label for="mapgen_terrain_alt_toggle"><span>Live Altitude</span></label>
                         </div>
-                        <div id="mapgen_terrain_alt_hint" style="font-size:10px; color:#ff9800; margin:2px 0 4px; font-style:italic; display:none;">Altitude available after generating .TER files — uses locally cached elevation data to avoid unnecessary server requests.</div>
+                        <div id="mapgen_terrain_alt_hint" style="font-size:10px; color:#ff9800; margin:2px 0 4px; font-style:italic; display:none;">Altitude is read from the .TER files in the terrain folder: it shows where a file has been built, with no server request.</div>
 
                         <div class="select">
                             <select id="mapgen_area_unit">
@@ -108,6 +101,20 @@
                             </select>
                             <label for="mapgen_area_unit"><span data-i18n="mapgenAreaUnit">Area Unit</span></label>
                         </div>
+                    </div>
+                </div>
+
+                <div id="mapgen_terrain_folder_box" class="config-section gui_box grey" style="display:none;">
+                    <div class="gui_box_titlebar">
+                        <div class="spacer_box_title" data-i18n="mapgenTerrainFolder">Terrain Folder</div>
+                    </div>
+                    <div class="spacer_box">
+                        <div class="mapgen-offline-hint" data-i18n="mapgenTerrainFolderHint">Terrain files (.TER) are kept here. Mission Control reads them, and they copy straight to the flight controller's SD card.</div>
+                        <div class="mapgen-sd-path" id="mapgen_terrain_folder_path"></div>
+                        <div class="mapgen-offline-sizes" id="mapgen_terrain_folder_info"></div>
+                        <a id="mapgen_terrain_folder_choose" class="btn" href="#" data-i18n="mapgenTerrainFolderChoose">Change Folder</a>
+                        <a id="mapgen_terrain_folder_open" class="btn" href="#" data-i18n="mapgenTerrainFolderOpen">Open Folder</a>
+                        <a id="mapgen_terrain_folder_default" class="btn" href="#" style="display:none;" data-i18n="mapgenTerrainFolderDefault">Use Default Folder</a>
                     </div>
                 </div>
 
@@ -165,7 +172,7 @@
                         <div class="spacer_box_title" data-i18n="mapgenOfflineData">Offline Data</div>
                     </div>
                     <div class="spacer_box">
-                        <div class="mapgen-offline-hint" data-i18n="mapgenOfflineHint">Download elevation data and map imagery ahead of time, so .TER files can be made without internet.</div>
+                        <div class="mapgen-offline-hint" data-i18n="mapgenOfflineHint">Build terrain files and download map imagery for an area ahead of time, so it is ready without internet. Imagery is kept in this folder:</div>
                         <div class="mapgen-sd-path" id="mapgen_offline_dir"></div>
                         <a id="mapgen_offline_change" class="btn" href="#" data-i18n="mapgenOfflineChangeFolder">Change Folder</a>
 

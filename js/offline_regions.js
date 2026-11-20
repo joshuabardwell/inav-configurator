@@ -1,19 +1,16 @@
-// Planning for the Map Generator's offline data downloads: which 1° elevation
-// cells and which map tiles a box or region needs, what is already in the
-// offline folder, and how big and slow the rest will be. DOM-free; tested by
-// tests/offline-regions.test.mjs.
+// Planning for terrain files and offline map imagery: which 1° cells and which
+// map tiles a box or region needs, what each cell's .TER file is built from,
+// what is already in the terrain folder, and how big and slow the rest will be.
+// DOM-free; tested by tests/offline-regions.test.mjs.
 
 import {
     CELL_INDEX_B64, CELL_INDEX_DATE,
     CELL_INDEX_SRTM_FILES, CELL_INDEX_SRTM_BYTES,
     CELL_INDEX_COPERNICUS_FILES, CELL_INDEX_COPERNICUS_BYTES,
 } from './terrain_cell_index.js';
-import {
-    srtmTileName, srtmUrl, srtmLocalPath, copernicusTileStem, copernicusUrl, copernicusLocalPath,
-    estimateDatSizeMB,
-} from './terrain_elevation.js';
+import { estimateDatSizeMB } from './terrain_elevation.js';
+import { terrainDatFilename } from './terrain_ter.js';
 
-export const SOURCES = ['srtm', 'copernicus'];
 const CELLS = 180 * 360;
 
 // ─── Cell index ───────────────────────────────────────────────────────────────
@@ -55,6 +52,50 @@ export function hasCellFile(source, lat, lon, index = cellIndex()) {
     return index[source][cellSlot(lat, lon)] > 0;
 }
 
+// ─── Which data a cell's .TER file is built from ──────────────────────────────
+
+// Copernicus has a file for every cell with land, except Armenia and Azerbaijan,
+// which it leaves out. Those cells sit inside this box (south-west corners,
+// inclusive); a cell in it with no Copernicus file is built from SRTM. The SRTM
+// file's size cannot tell land from sea: the SRTM set has a file for every cell
+// on the globe, and open-ocean files run to 10 MB.
+const COPERNICUS_LEFT_OUT = { lat0: 38, lat1: 41, lon0: 43, lon1: 50 };
+
+// 'copernicus', 'srtm', or null for a cell that is all sea (no source has land
+// there: its .TER is sea level and needs no download).
+export function terSourceForCell(lat, lon, index = cellIndex()) {
+    if (index.copernicus[cellSlot(lat, lon)] > 0) return 'copernicus';
+    const box = COPERNICUS_LEFT_OUT;
+    if (lat >= box.lat0 && lat <= box.lat1 && lon >= box.lon0 && lon <= box.lon1 &&
+        index.srtm[cellSlot(lat, lon)] > 0) {
+        return 'srtm';
+    }
+    return null;
+}
+
+// Building a Copernicus cell downloads its tile whole and reads thin strips of
+// up to five neighbours. Measured over five cells the total was 1.1 to 1.9 times
+// the tile, depending on how much land the neighbours hold.
+const COPERNICUS_EDGE_FACTOR = 1.5;
+
+// What building one cell's .TER takes: { source, downloadBytes, terBytes }.
+// source is 'copernicus', 'srtm' or 'sea'; a sea cell downloads nothing.
+// downloadBytes is an estimate; terBytes is exact (a file's size depends only on
+// its latitude).
+export function cellBuildEstimate(lat, lon, index = cellIndex()) {
+    const source = terSourceForCell(lat, lon, index);
+    let downloadBytes = 0;
+    if (source === 'copernicus') {
+        downloadBytes = Math.round(cellFileBytes('copernicus', lat, lon, index) * COPERNICUS_EDGE_FACTOR);
+    } else if (source === 'srtm') {
+        // SRTM grids are read whole: the cell and its E, N and NE neighbours.
+        for (const [nLat, nLon] of [[lat, lon], [lat, lon + 1], [lat + 1, lon], [lat + 1, lon + 1]]) {
+            if (nLat <= 89) downloadBytes += cellFileBytes('srtm', nLat, wrapLon(nLon), index);
+        }
+    }
+    return { source: source || 'sea', downloadBytes, terBytes: terBytes(lat) };
+}
+
 // ─── Cells ────────────────────────────────────────────────────────────────────
 
 export function wrapLon(lon) {
@@ -92,39 +133,9 @@ export function cellsForRange({ lat0, lat1, lon0, lon1 }) {
     return cells;
 }
 
-// The cells whose elevation files a set of .TER cells needs: each cell plus its
-// E, N and NE neighbours (a .TER file overshoots its square to the north and
-// east). Copernicus also needs S and SE: a GeoTIFF has no row for its own south
-// edge, so the grid's last row (and the SE corner) is read from the tiles below.
-// SRTM .hgt files carry their own edges. No duplicates; order follows the input.
-export function withNeighbours(cells, source = 'srtm') {
-    const seen = new Set();
-    const out = [];
-    const add = (lat, lon) => {
-        if (lat > 89) return;
-        const c = { lat, lon: wrapLon(lon) };
-        const k = cellKey(c);
-        if (seen.has(k)) return;
-        seen.add(k);
-        out.push(c);
-    };
-    for (const c of cells) {
-        add(c.lat, c.lon);
-        add(c.lat, c.lon + 1);
-        add(c.lat + 1, c.lon);
-        add(c.lat + 1, c.lon + 1);
-        if (source === 'copernicus' && c.lat > -90) {
-            add(c.lat - 1, c.lon);
-            add(c.lat - 1, c.lon + 1);
-        }
-    }
-    return out;
-}
-
 // ─── Region presets ───────────────────────────────────────────────────────────
 // Inclusive 1° cell ranges (south-west corners). Regions overlap at the edges
-// on purpose; only cells with land data are downloaded, so the boxes can be
-// generous. imageryZoom is the default imagery depth: deep enough to find a
+// on purpose; only cells with land are built, so the boxes can be generous. imageryZoom is the default imagery depth: deep enough to find a
 // flying site, shallow enough to stay a few GB.
 export const REGIONS = [
     { id: 'globe', name: 'Whole globe', lat0: -90, lat1: 89, lon0: -180, lon1: 179, imageryZoom: 7 },
@@ -227,22 +238,6 @@ export function imageryLocalPath(provider, type, z, x, y, ext) {
     return `imagery/${provider}/${type}/${z}/${x}/${y}.${ext}`;
 }
 
-// ─── Elevation files ──────────────────────────────────────────────────────────
-
-export function elevationFile(source, lat, lon) {
-    if (source === 'copernicus') {
-        return { name: copernicusTileStem(lat, lon), url: copernicusUrl(lat, lon), path: copernicusLocalPath(lat, lon) };
-    }
-    return { name: srtmTileName(lat, lon), url: srtmUrl(lat, lon), path: srtmLocalPath(lat, lon) };
-}
-
-// File name (without folder) of each source's local file, for matching the
-// offline folder's listing against cells.
-export function elevationFileName(source, lat, lon) {
-    const p = elevationFile(source, lat, lon).path;
-    return p.slice(p.lastIndexOf('/') + 1);
-}
-
 // ─── Plans ────────────────────────────────────────────────────────────────────
 
 const terMBByLat = new Map();
@@ -251,61 +246,52 @@ function terBytes(lat) {
     return terMBByLat.get(lat) * 1048576;
 }
 
-// What a download of `cells` (the .TER cells the user wants) needs.
-//   present: { srtm: Set<fileName>, copernicus: Set<fileName> } from the folder
+// Decoding, converting and writing one cell, on top of its download. Measured
+// in node: about 2 s to decode the tile, 2-3 s to convert, the rest to write.
+const BUILD_SECONDS_PER_CELL = 6;
+
+// What having the .TER files of `cells` in the terrain folder takes.
+//   present: Set of .TER file names already in the folder
+//   includeSea: also build sea-level files for cells that are all sea. A drawn
+//               box does (the aircraft may fly there); a region does not.
 //   imagery: { south, west, north, east, zMax, layers: [layer ids] } or null
 //   bytesPerSecond: for the time estimate
-// Elevation totals are given for both sources, so the dialog can show the one
-// not selected too. Only cells the index lists are counted: the rest are sea
-// and need no file. (SRTM has a file for every cell; Copernicus only for land.)
-export function planDownload({ cells, present, imagery, bytesPerSecond, index = cellIndex() }) {
-    const elevation = {};
-    for (const source of SOURCES) {
-        const needed = withNeighbours(cells, source);
-        const have = present?.[source] || new Set();
-        let files = 0, presentCount = 0, missingBytes = 0, totalBytes = 0;
-        const missing = [];
-        for (const c of needed) {
-            const bytes = cellFileBytes(source, c.lat, c.lon, index);
-            if (!bytes) continue;
-            files++;
-            totalBytes += bytes;
-            if (have.has(elevationFileName(source, c.lat, c.lon))) {
-                presentCount++;
-            } else {
-                missingBytes += bytes;
-                missing.push(c);
-            }
+// terrain.files counts the cells that get a file, terrain.missing lists the
+// ones still to build, terrain.sea the all-sea cells left out.
+export function planDownload({ cells, present, includeSea = false, imagery, bytesPerSecond, index = cellIndex() }) {
+    const have = present || new Set();
+    const terrain = { files: 0, present: 0, missing: [], sea: 0, downloadBytes: 0, terBytes: 0, totalTerBytes: 0 };
+    for (const c of cells) {
+        const estimate = cellBuildEstimate(c.lat, c.lon, index);
+        if (estimate.source === 'sea' && !includeSea) {
+            terrain.sea++;
+            continue;
         }
-        elevation[source] = { cells: needed.length, files, present: presentCount, missing, missingBytes, totalBytes };
+        terrain.files++;
+        terrain.totalTerBytes += estimate.terBytes;
+        if (have.has(terrainDatFilename(c.lat, c.lon))) {
+            terrain.present++;
+        } else {
+            terrain.missing.push(c);
+            terrain.downloadBytes += estimate.downloadBytes;
+            terrain.terBytes += estimate.terBytes;
+        }
     }
 
     let imageryPlan = null;
     if (imagery && imagery.layers?.length) {
         const ranges = tileRanges(imagery.south, imagery.west, imagery.north, imagery.east, 0, imagery.zMax);
-        const tiles = ranges.reduce((s, r) => s + r.count, 0);
-        const perTile = imagery.layers.reduce((s, id) => s + IMAGERY_LAYERS[id].avgBytes, 0);
+        const tiles = ranges.reduce((sum, r) => sum + r.count, 0);
+        const perTile = imagery.layers.reduce((sum, id) => sum + IMAGERY_LAYERS[id].avgBytes, 0);
         imageryPlan = { ranges, tiles, files: tiles * imagery.layers.length, bytes: tiles * perTile, zMax: imagery.zMax, layers: imagery.layers };
     }
 
-    // .TER output if every cell were generated. SRTM has a file (sea level over
-    // water) for every cell; Copernicus skips cells it has no tile for.
-    const terTotal = { srtm: 0, copernicus: 0 };
-    for (const c of cells) {
-        for (const source of SOURCES) {
-            if (cellFileBytes(source, c.lat, c.lon, index)) terTotal[source] += terBytes(c.lat);
-        }
-    }
-
     const rate = bytesPerSecond > 0 ? bytesPerSecond : 12.5e6;
-    const secondsFor = source => (elevation[source].missingBytes + (imageryPlan?.bytes || 0)) / rate;
-
     return {
         cells: cells.length,
-        elevation,
+        terrain,
         imagery: imageryPlan,
-        terBytes: terTotal,
-        seconds: { srtm: secondsFor('srtm'), copernicus: secondsFor('copernicus') },
+        seconds: (terrain.downloadBytes + (imageryPlan?.bytes || 0)) / rate + terrain.missing.length * BUILD_SECONDS_PER_CELL,
     };
 }
 

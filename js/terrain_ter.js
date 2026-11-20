@@ -160,6 +160,17 @@ export function terrainDatFilename(lat, lon) {
     return latPrefix + latStr + lonPrefix + lonStr + '.TER';
 }
 
+/* South-west corner { lat, lon } of the cell a .TER file name stands for, or null
+ * when the name is not one. */
+export function terrainCellOfFilename(name) {
+    const match = /^([NS])(\d{2})([EW])(\d{3})\.TER$/i.exec(String(name));
+    if (!match) return null;
+    const lat = Number(match[2]) * (match[1].toUpperCase() === 'N' ? 1 : -1);
+    const lon = Number(match[4]) * (match[3].toUpperCase() === 'E' ? 1 : -1);
+    if (lat < -90 || lat > 89 || lon < -180 || lon > 179) return null;
+    return { lat: lat + 0, lon: lon + 0 };      // + 0: "S00" and "W000" give 0, not -0
+}
+
 /* Number of block rows (north) and columns (east) in the tile whose south-west
  * corner is degLat/degLon, as the writer lays them out. */
 export function terTileDimensions(degLat, degLon) {

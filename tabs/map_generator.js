@@ -18,16 +18,20 @@ import { globalSettings, UnitType } from './../js/globalSettings';
 import JSZip from 'jszip';
 import { terrainDatFilename } from './../js/terrain_ter.js';
 import {
-    srtmTileName, estimateDatSizeMB, createDatFromHgt, ensureSrtmCellData,
-    COPERNICUS_NOTICE_1, COPERNICUS_NOTICE_2, TERRAIN_ATTR_SRTM, TERRAIN_ATTR_COPERNICUS,
-    copernicusNoticeText, COPERNICUS_CACHE_PREFIX, HGT_GRID_BYTES, ensureCopernicusCellData,
-    MissingElevationError,
+    estimateDatSizeMB, COPERNICUS_NOTICE_1, COPERNICUS_NOTICE_2, TERRAIN_ATTR_COPERNICUS, HGT_GRID_BYTES,
 } from './../js/terrain_elevation.js';
 import {
-    cellsForBounds, cellsForRange, withNeighbours, cellKey, hasCellFile, cellFileBytes, elevationFile, elevationFileName,
+    cellsForBounds, cellsForRange, cellBuildEstimate,
     REGIONS, regionById, BOX_IMAGERY_ZOOM, IMAGERY_LAYERS, imageryLocalPath, tilesInRanges,
     imageryTotalsByZoom, planDownload, formatBytes, formatDuration, CELL_INDEX_INFO,
 } from './../js/offline_regions.js';
+import { buildCellTer, pruneImageCache } from './../js/terrain_build.js';
+import {
+    buildTerrain, copyTerrainTo, listTerrain, onTerrainChange, setTerrainFolder, terrainFilePath,
+    terrainFolderDir, terrainFolderIsDefault, terrainFolderParentDir, terrainLibraryAvailable, terrainNoticeText,
+    TERRAIN_NOTICE_FILE, TerrainFileState,
+} from './../js/terrain_library.js';
+import { forgetTerFiles, getElevations } from './../js/elevationProvider.js';
 
 // Fix Leaflet default marker icon paths (broken by bundlers)
 delete L.Icon.Default.prototype._getIconUrl;
@@ -368,92 +372,56 @@ const tileCache = {
     },
 };
 
-// ─── IndexedDB HGT cache (persist downloaded SRTM tiles for resume/reuse) ──
-const hgtDb = {
-    _instance: null,
+// ─── The old IndexedDB elevation cache ─────────────────────────────────────
+// Earlier versions kept decoded elevation grids here (about 26 MB each).
+// Nothing reads or writes them any more: terrain files are built straight
+// into the terrain folder. This only finds the database, so the user can
+// delete what is left in it.
+const oldElevationCache = {
+    NAME: 'terrainHgtCache',
 
-    open() {
-        if (this._instance) return Promise.resolve(this._instance);
-        return new Promise((resolve, reject) => {
-            const req = indexedDB.open('terrainHgtCache', 1);
-            req.onupgradeneeded = e => e.target.result.createObjectStore('hgt');
-            req.onsuccess = e => { this._instance = e.target.result; resolve(this._instance); };
-            req.onerror = () => reject(req.error);
-        });
-    },
-
-    async get(key) {
+    // Number of grids still stored; 0 when there is no database. Looks the
+    // database up first: opening one that does not exist would create it.
+    async count() {
         try {
-            const db = await this.open();
-            return new Promise(resolve => {
-                const req = db.transaction('hgt', 'readonly').objectStore('hgt').get(key);
-                req.onsuccess = () => resolve(req.result || null);
-                req.onerror = () => resolve(null);
-            });
-        } catch (_) { return null; }
-    },
-
-    async put(key, data) {
-        try {
-            const db = await this.open();
-            return new Promise(resolve => {
-                const tx = db.transaction('hgt', 'readwrite');
-                tx.objectStore('hgt').put(data, key);
-                tx.oncomplete = () => resolve();
-                tx.onerror = () => resolve();
-            });
-        } catch (_) { /* ignore */ }
-    },
-
-    async cachedSet() {
-        try {
-            const db = await this.open();
-            return new Promise(resolve => {
-                const req = db.transaction('hgt', 'readonly').objectStore('hgt').getAllKeys();
-                req.onsuccess = () => resolve(new Set(req.result));
-                req.onerror = () => resolve(new Set());
-            });
-        } catch (_) { return new Set(); }
-    },
-
-    async clear() {
-        try {
-            const db = await this.open();
-            return new Promise(resolve => {
-                const tx = db.transaction('hgt', 'readwrite');
-                tx.objectStore('hgt').clear();
-                tx.oncomplete = () => resolve();
-                tx.onerror = () => resolve();
-            });
-        } catch (_) { /* ignore */ }
-    },
-
-    // One-time sweep: grids stored under the pre-width-fix 'cop_' prefix are
-    // wrong at |lat| >= 50° and unreachable since the bump to 'cop2_' — drop
-    // them so they stop taking up space. ('cop2_' keys do not match.)
-    async dropOldCopernicusGrids() {
-        try {
-            const db = await this.open();
-            return new Promise(resolve => {
-                const tx = db.transaction('hgt', 'readwrite');
-                const store = tx.objectStore('hgt');
-                const req = store.getAllKeys();
-                req.onsuccess = () => {
-                    for (const key of req.result) {
-                        if (typeof key === 'string' && key.startsWith('cop_')) store.delete(key);
+            const all = await indexedDB.databases?.();
+            if (!all || !all.some(db => db.name === this.NAME)) return 0;
+            return await new Promise(resolve => {
+                const req = indexedDB.open(this.NAME);
+                req.onerror = () => resolve(0);
+                req.onsuccess = e => {
+                    const db = e.target.result;
+                    if (!db.objectStoreNames.contains('hgt')) {
+                        db.close();
+                        resolve(0);
+                        return;
                     }
+                    const count = db.transaction('hgt', 'readonly').objectStore('hgt').count();
+                    count.onsuccess = () => { db.close(); resolve(count.result); };
+                    count.onerror = () => { db.close(); resolve(0); };
                 };
-                tx.oncomplete = () => resolve();
-                tx.onerror = () => resolve();
             });
-        } catch (_) { /* ignore */ }
+        } catch (_) {
+            return 0;
+        }
+    },
+
+    remove() {
+        return new Promise(resolve => {
+            const req = indexedDB.deleteDatabase(this.NAME);
+            req.onsuccess = () => resolve();
+            req.onerror = () => resolve();
+            req.onblocked = () => resolve();
+        });
     },
 };
 
-// ─── Offline data folder (elevation originals + map imagery) ───────────────
-// Region and box downloads put the files here as downloaded, and generation
-// reads them before going to the network. Electron only: the web build has no
-// file system, so there the folder is unavailable and generation works as before.
+// ─── Offline data folder (map imagery) ─────────────────────────────────────
+// Region and box downloads put map tiles here, and the map shows them without
+// a connection. Electron only: the web build has no file system. Terrain
+// files are not kept here: they live in the terrain folder
+// (js/terrain_library.js). An elevation/ subfolder may be left over from
+// earlier versions, which kept raw elevation downloads in it.
 const offlineStore = {
     available() {
         return offlineFolderAvailable();
@@ -478,25 +446,7 @@ const offlineStore = {
     write(rel, bytes) {
         return offlineFolderWrite(rel, bytes);
     },
-
-    // File names present in elevation/<source>/.
-    async elevationNames(source) {
-        if (!this.available()) return new Set();
-        const files = await globalThis.electronAPI.listFiles(this.path('elevation/' + source));
-        return new Set(files.map(f => f.name));
-    },
 };
-
-// The storage that js/terrain_elevation.js reads and writes during generation.
-function makeTerrainIo() {
-    const folder = offlineStore.available();
-    return {
-        hgtDb,
-        hasFile: (source, lat, lon) => hasCellFile(source, lat, lon),
-        readLocal: folder ? rel => offlineStore.read(rel) : null,
-        saveLocal: folder ? (rel, bytes) => offlineStore.write(rel, bytes) : null,
-    };
-}
 
 // ─── Map tiles from the offline folder ─────────────────────────────────────
 // A tile layer that shows imagery/<provider>/<type>/z/x/y.<ext> from the
@@ -576,6 +526,8 @@ function cachedTileLayer(url, options, provider, type, ext) {
 
 // Set while the tab is open; cleanup() calls it to stop an offline download.
 let stopOfflineDownload = null;
+// Removes this visit's listener on the terrain folder (js/terrain_library.js).
+let stopTerrainListening = null;
 
 function boundsCells(bounds) {
     return cellsForBounds(bounds.getSouth(), bounds.getWest(), bounds.getNorth(), bounds.getEast());
@@ -588,10 +540,6 @@ TABS.map_generator.initialize = function (callback) {
     if (GUI.active_tab !== TABS.map_generator) {
         GUI.active_tab = TABS.map_generator;
     }
-
-    void hgtDb.dropOldCopernicusGrids();
-    // Ask Chromium not to evict the IndexedDB elevation cache under disk pressure.
-    void navigator.storage?.persist?.().catch(() => {});
 
     loadHtml();
 
@@ -613,13 +561,16 @@ TABS.map_generator.initialize = function (callback) {
         const TILE_CONCURRENCY = 4;
         let terrainGridLayer = null;
         let liveAltEnabled = false;
-        let liveAltCache = {};
+        let liveAltPoint = null;
+        let liveAltTimer = null;
+        let liveAltSequence = 0;
         let preTerrainZoom = null;
-        let terrainFallbackPending = false;
+        let terrainRunController = null;    // aborts the terrain build or copy shown in the modal
         let offlineJob = null;              // the offline download shown in the modal, if any
-        let offlinePresent = { srtm: new Set(), copernicus: new Set() };   // file names in the offline folder
-        let offlinePresentGen = 0;          // bumped each time offlinePresent is re-read
-        let offlineFree = null;             // free bytes on the offline folder's drive, null if unknown
+        let terrainFiles = new Map();       // .TER files in the terrain folder, by name (listTerrain)
+        let terrainFilesGen = 0;            // bumped each time terrainFiles is re-read
+        let terrainFree = null;             // free bytes on the terrain folder's drive, null if unknown
+        let offlineFree = null;             // free bytes on the offline (imagery) folder's drive, null if unknown
         let offlineEstimateQueued = false;
         let offlineElevationMemo = { key: null, plan: null };
 
@@ -658,7 +609,6 @@ TABS.map_generator.initialize = function (callback) {
 
         $('#mapgen_subtarget').val(savedSubtarget);
         $('#mapgen_target').val(savedTarget);
-        $('#mapgen_terrain_source').val(settingsSaved ? store.get('mapgen_terrain_source', 'copernicus') : 'copernicus');
         $('#mapgen_provider').val(savedProvider);
         $('#mapgen_maptiler_key').val(savedMaptilerKey);
         $('#mapgen_project_name').val(savedProject);
@@ -1178,10 +1128,7 @@ TABS.map_generator.initialize = function (callback) {
 
         map.on('mousemove', e => {
             $('#mapgen_coords_output').text(`Lat: ${e.latlng.lat.toFixed(4)}, Lng: ${e.latlng.lng.toFixed(4)}`);
-            if (liveAltEnabled) {
-                const alt = getAltFromCache(e.latlng.lat, e.latlng.lng);
-                $('#mapgen_alt_output').text(alt !== null ? 'Alt: ' + alt + 'm' : 'Alt: \u2014');
-            }
+            if (liveAltEnabled) queueLiveAlt(e.latlng.lat, e.latlng.lng);
         });
 
         map.on('zoomend', () => {
@@ -1225,7 +1172,6 @@ TABS.map_generator.initialize = function (callback) {
         // ── Settings persistence ────────────────────────────────────
         function saveSettings() {
             store.set('mapgen_target', $('#mapgen_target').val());
-            store.set('mapgen_terrain_source', $('#mapgen_terrain_source').val());
             store.set('mapgen_subtarget', $('#mapgen_subtarget').val());
             store.set('mapgen_provider', $('#mapgen_provider').val());
             store.set('mapgen_map_type', $('#mapgen_maptype').val());
@@ -1251,11 +1197,9 @@ TABS.map_generator.initialize = function (callback) {
             store.delete('mapgen_area_unit');
             store.delete('mapgen_last_center');
             store.delete('mapgen_last_zoom');
-            store.delete('mapgen_terrain_source');
             // Note: mapgen_maptiler_key is intentionally NOT deleted on restore defaults
             // Reset UI to defaults
             $('#mapgen_target').val('terrain');
-            $('#mapgen_terrain_source').val('copernicus');
             $('#mapgen_subtarget').val('ethos');
             $('#mapgen_provider').val('OSM');
             $('#mapgen_project_name').val('MyLocalField');
@@ -1271,12 +1215,6 @@ TABS.map_generator.initialize = function (callback) {
 
         // ── Control event bindings ──────────────────────────────────
         $('#mapgen_target').on('change', () => { syncMapOptions(); triggerUpdate(); });
-        $('#mapgen_terrain_source').on('change', () => {
-            store.set('mapgen_terrain_source', $('#mapgen_terrain_source').val());
-            updateTerrainSourceUI();
-            triggerUpdate();
-            if (isTerrainMode()) updateTerrainGrid();
-        });
         $('#mapgen_provider').on('change', () => { syncMapOptions(); switchMapLayer(); });
         $('#mapgen_maptype').on('change', () => { switchMapLayer(); });
         $('#mapgen_maptiler_key').on('input', () => {
@@ -1492,6 +1430,7 @@ TABS.map_generator.initialize = function (callback) {
                 return;
             }
             syncAborted = true;
+            if (terrainRunController) terrainRunController.abort();
             hideModal();
         });
 
@@ -1500,14 +1439,6 @@ TABS.map_generator.initialize = function (callback) {
             if (offlineJob) {
                 await offlineConfirmClicked();
                 return;
-            }
-            // Confirming the "Copernicus unavailable" prompt is the user's
-            // explicit consent to switch elevation source for this generation.
-            if (terrainFallbackPending) {
-                terrainFallbackPending = false;
-                $('#mapgen_terrain_source').val('srtm');
-                store.set('mapgen_terrain_source', 'srtm');
-                updateTerrainSourceUI();
             }
             if (isTerrainMode()) {
                 await terrainGenerateAndSync();
@@ -1690,53 +1621,19 @@ TABS.map_generator.initialize = function (callback) {
             return $('#mapgen_target').val() === 'terrain';
         }
 
-        // Anything other than an explicit 'srtm' means Copernicus, so a missing
-        // or unreadable setting still lands on the more accurate source.
-        function getTerrainSource() {
-            return $('#mapgen_terrain_source').val() === 'srtm' ? 'srtm' : 'copernicus';
-        }
-
-        function terrainSourceLabel() {
-            return getTerrainSource() === 'srtm' ? 'Terrain — SRTM1 (30m)' : 'Terrain — Copernicus GLO-30';
-        }
-
+        // Terrain files are built from Copernicus GLO-30 (NASA SRTM for the few
+        // cells it leaves out): the note and the map attribution say so.
         function updateTerrainSourceUI() {
-            const isTerrain = isTerrainMode();
-            const copernicus = getTerrainSource() === 'copernicus';
-            map.attributionControl.removeAttribution(TERRAIN_ATTR_SRTM);
             map.attributionControl.removeAttribution(TERRAIN_ATTR_COPERNICUS);
-            if (isTerrain) {
-                map.attributionControl.addAttribution(copernicus ? TERRAIN_ATTR_COPERNICUS : TERRAIN_ATTR_SRTM);
+            if (isTerrainMode()) {
+                map.attributionControl.addAttribution(TERRAIN_ATTR_COPERNICUS);
             }
-            if (copernicus) {
-                $('#mapgen_terrain_source_note').html(
-                    'Global coverage incl. &gt;60°N.' +
-                    '<div style="font-size:9px; color:#666; margin-top:3px;">' +
-                    $('<span>').text(COPERNICUS_NOTICE_1).html() + '. ' +
-                    $('<span>').text(COPERNICUS_NOTICE_2).html() + '.</div>');
-                $('#mapgen_hint_terrain').text('Hint: One .TER file per 1°×1° grid square (~111 km). Data: Copernicus GLO-30 at 30m resolution. Ocean depths are clamped to 0m.');
-            } else {
-                $('#mapgen_terrain_source_note').html('Real SRTM between 60°N and 56°S. Beyond that the server only has coarse fill data (errors of tens to hundreds of metres) — use Copernicus there.');
-                $('#mapgen_hint_terrain').text('Hint: One .TER file per 1°×1° grid square (~111 km). Data: NASA SRTM1 at 30m resolution. Ocean depths are clamped to 0m.');
-            }
-        }
-
-        // Copernicus is fetched from a public bucket — if it cannot be reached,
-        // ask before falling back to SRTM. Never switch elevation source
-        // silently: the user must know which source produced the files.
-        function showCopernicusFallbackPrompt(err) {
-            $('#mapgen_download_status').text('Copernicus server unavailable.');
-            $('#mapgen_progress_section').hide();
-            $('#mapgen_modal_actions').show();
-            $('#mapgen_sync_info').html(
-                '<div style="color:#aaa; font-size:13px; line-height:1.6; margin:8px 0;">' +
-                '<b style="color:#ff9800;">Copernicus GLO-30 is unavailable</b> (server unreachable or throttling).<br>' +
-                (err ? $('<span>').text(err.message).html() + '.<br>' : '') + '<br>' +
-                'You can switch this generation to the <b>NASA SRTM1</b> fallback source (real SRTM between 60°N and 56°S, coarse fill data beyond), ' +
-                'or close and try Copernicus again later.</div>');
-            terrainFallbackPending = true;
-            $('#mapgen_modal_confirm').show().text('Switch to SRTM & Retry');
-            $('#mapgen_modal_cancel').text('Close');
+            $('#mapgen_terrain_source_note').html(
+                'Elevation data: Copernicus GLO-30, global coverage incl. &gt;60°N. NASA SRTM where Copernicus has none.' +
+                '<div style="font-size:9px; color:#666; margin-top:3px;">' +
+                $('<span>').text(COPERNICUS_NOTICE_1).html() + '. ' +
+                $('<span>').text(COPERNICUS_NOTICE_2).html() + '.</div>');
+            $('#mapgen_hint_terrain').text('Hint: One .TER file per 1°×1° grid square (~111 km), 30m resolution. Ocean depths are clamped to 0m.');
         }
 
         function getTargetCategory() {
@@ -1768,16 +1665,19 @@ TABS.map_generator.initialize = function (callback) {
                 }).addTo(terrainGridLayer);
             }
 
-            // Shade cells whose elevation data (with edge neighbours) is in
-            // the offline folder. Skipped when zoomed far out: too many cells.
-            if (offlineStore.available() && (latMax - latMin) * (lonMax - lonMin) <= 4000) {
-                const source = getTerrainSource();
+            // Shade cells whose .TER file is in the terrain folder: green when it
+            // was built by this version, amber when it is unlabelled or from an
+            // older one. Skipped when zoomed far out: too many cells.
+            if (terrainLibraryAvailable() && (latMax - latMin) * (lonMax - lonMin) <= 4000) {
                 const readyStyle = { color: '#00e676', weight: 1, opacity: 0.8, fillColor: '#00e676', fillOpacity: 0.22, interactive: false };
+                const otherStyle = { color: '#ffb300', weight: 1, opacity: 0.8, fillColor: '#ffb300', fillOpacity: 0.22, interactive: false };
                 for (let lat = Math.max(latMin, -90); lat < Math.min(latMax, 90); lat++) {
                     for (let lon = lonMin; lon < lonMax; lon++) {
                         const wrapped = ((lon + 180) % 360 + 360) % 360 - 180;
-                        if (cellReadyOffline(source, lat, wrapped)) {
-                            L.rectangle([[lat, lon], [lat + 1, lon + 1]], readyStyle).addTo(terrainGridLayer);
+                        const file = terrainFiles.get(terrainDatFilename(lat, wrapped));
+                        if (file) {
+                            L.rectangle([[lat, lon], [lat + 1, lon + 1]],
+                                file.state === TerrainFileState.CURRENT ? readyStyle : otherStyle).addTo(terrainGridLayer);
                         }
                     }
                 }
@@ -1826,7 +1726,7 @@ TABS.map_generator.initialize = function (callback) {
             }
 
             terrainGridLayer.addTo(map);
-            updateOfflineEstimate();   // box deleted, source changed or folder re-read
+            updateOfflineEstimate();   // box deleted or folder re-read
         }
 
         function updateTerrainStatus() {
@@ -1853,17 +1753,9 @@ TABS.map_generator.initialize = function (callback) {
                 `<span class="mapgen-area">Grid Coverage: ${tiles.length} tile(s) \u00b7 ${formatArea(gridAreaSqM, unit)}</span><br>` +
                 `<span class="mapgen-tiles">Est. Size: ~${estSizeMB} MB</span><br>` +
                 `<span style="color:#888; font-size:11px;">${fileList.join(', ')}</span>`;
-            // Copernicus publishes no tiles north of 84\u00b0N. The SRTM fallback's
-            // server answers everywhere, but outside the SRTM mission's
-            // 60\u00b0N\u201356\u00b0S band it only holds coarse 2016 fill data (GMTED /
-            // ETOPO1 \u2014 measured errors reach hundreds of metres), so it gets
-            // a warning of its own there.
-            if (getTerrainSource() === 'copernicus') {
-                if (bounds.getNorth() > 84) {
-                    statusHtml += `<br><span style="color:#c62828; font-size:11px;">&#9888;&#65039; Selection extends beyond Copernicus coverage (84\u00b0N). Tiles beyond will have no elevation data.</span>`;
-                }
-            } else if (bounds.getNorth() > 60 || bounds.getSouth() < -56) {
-                statusHtml += `<br><span style="color:#c62828; font-size:11px;">&#9888;&#65039; Selection extends beyond real SRTM coverage (60\u00b0N\u201356\u00b0S). This source only has coarse fill data there \u2014 errors reach hundreds of metres. Use Copernicus instead.</span>`;
+            // Copernicus publishes no tiles north of 84°N.
+            if (bounds.getNorth() > 84) {
+                statusHtml += `<br><span style="color:#c62828; font-size:11px;">&#9888;&#65039; Selection extends beyond Copernicus coverage (84°N). Files beyond will hold sea level.</span>`;
             }
             $('#mapgen_status').html(statusHtml);
         }
@@ -1872,9 +1764,9 @@ TABS.map_generator.initialize = function (callback) {
             if (!map) return; // called before map init from syncMapOptions
             const isTerrain = isTerrainMode();
 
-            // Elevation source picker (terrain only) and its attribution
-            $('#mapgen_terrain_source_wrapper').toggle(isTerrain);
+            // The elevation data's attribution, and the terrain folder (desktop app only)
             $('#mapgen_terrain_source_note').toggle(isTerrain);
+            $('#mapgen_terrain_folder_box').toggle(isTerrain && terrainLibraryAvailable());
             updateTerrainSourceUI();
 
             // Zoom to terrain-friendly level
@@ -1920,10 +1812,8 @@ TABS.map_generator.initialize = function (callback) {
             }
             if (isTerrain) {
                 updateTerrainStatus();
-                updateHgtCacheInfo();
-            } else {
-                $('#mapgen_clear_hgt_cache').hide();
             }
+            void updateOldCacheInfo();
             // Offline data panel: terrain mode, desktop app only (needs a folder)
             const showOffline = isTerrain && offlineStore.available();
             $('#mapgen_offline_box').toggle(showOffline);
@@ -1954,51 +1844,55 @@ TABS.map_generator.initialize = function (callback) {
             if (!liveAltEnabled) $('#mapgen_alt_output').text('Alt: \u2014');
         }
 
-        function getAltFromCache(lat, lon) {
-            const tileLat = Math.floor(lat);
-            const tileLon = Math.floor(lon);
-            const key = tileLat + '_' + tileLon;
-            const hgtView = liveAltCache[key];
-            if (!hgtView) return null;
-            const fracLat = Math.max(0, Math.min(1, lat - tileLat));
-            const fracLon = Math.max(0, Math.min(1, lon - tileLon));
-            const row = Math.max(0, Math.min(3600, Math.round((1 - fracLat) * 3600)));
-            const col = Math.max(0, Math.min(3600, Math.round(fracLon * 3600)));
-            const v = hgtView.getInt16((row * 3601 + col) * 2, false);
-            if (v === -32768) return 0;
-            return v < 0 ? 0 : v;
+        // The height under the cursor, read from the .TER files in the terrain
+        // folder (no server request). Asked at most every 150 ms; an answer for
+        // an older cursor position is dropped.
+        function queueLiveAlt(lat, lon) {
+            liveAltPoint = { lat, lon: ((lon + 180) % 360 + 360) % 360 - 180 };
+            if (liveAltTimer) return;
+            liveAltTimer = setTimeout(async () => {
+                liveAltTimer = null;
+                const sequence = ++liveAltSequence;
+                let result = null;
+                try {
+                    [result] = await getElevations([liveAltPoint], { online: false });
+                } catch (_) {
+                    result = null;
+                }
+                if (sequence !== liveAltSequence || !liveAltEnabled) return;
+                $('#mapgen_alt_output').text(result && result.elevation !== null
+                    ? 'Alt: ' + Math.round(result.elevation) + 'm' : 'Alt: —');
+            }, 150);
         }
 
         $('#mapgen_terrain_alt_toggle').on('change', toggleLiveAlt);
 
-        // ── HGT cache UI ────────────────────────────────────────────
-        async function updateHgtCacheInfo() {
-            try {
-                const cached = await hgtDb.cachedSet();
-                if (cached.size > 0 && isTerrainMode()) {
-                    $('#mapgen_clear_hgt_cache').text(`Clear Elevation Cache (${cached.size} tile${cached.size > 1 ? 's' : ''}, ~${formatBytes(cached.size * HGT_GRID_BYTES)})`).show();
-                } else {
-                    $('#mapgen_clear_hgt_cache').hide();
-                }
-            } catch (_) {
+        // ── Old elevation cache ─────────────────────────────────────
+        // Earlier versions cached decoded elevation grids in IndexedDB. They
+        // are no longer used; the button shows while any are left, to delete them.
+        async function updateOldCacheInfo() {
+            const count = await oldElevationCache.count();
+            if (count > 0) {
+                $('#mapgen_clear_hgt_cache').text(`Delete old elevation cache (${count} grid${count > 1 ? 's' : ''}, ~${formatBytes(count * HGT_GRID_BYTES)}, no longer used)`).show();
+            } else {
                 $('#mapgen_clear_hgt_cache').hide();
             }
         }
 
-        $('#mapgen_clear_hgt_cache').on('click', async () => {
-            const cached = await hgtDb.cachedSet();
-            if (cached.size === 0) return;
-            if (!await globalThis.electronAPI.confirmDialog(`Clear ${cached.size} cached elevation tile(s) (~${formatBytes(cached.size * HGT_GRID_BYTES)})?`)) return;
-            await hgtDb.clear();
-            liveAltCache = {};
-            updateHgtCacheInfo();
+        $('#mapgen_clear_hgt_cache').on('click', async (e) => {
+            e.preventDefault();
+            const count = await oldElevationCache.count();
+            if (count === 0) return;
+            if (!await globalThis.electronAPI.confirmDialog(`Delete ${count} cached elevation grid(s) (~${formatBytes(count * HGT_GRID_BYTES)})? Terrain files are built without this cache now.`)) return;
+            await oldElevationCache.remove();
+            updateOldCacheInfo();
         });
 
         // ── Offline data panel ──────────────────────────────────────
-        // Downloads elevation originals and Esri imagery into the offline
-        // folder (offlineStore). Files already there are skipped, so running
-        // the same download again resumes an interrupted one.
-        const OFFLINE_ELEVATION_CONCURRENCY = 2;
+        // Builds terrain files into the terrain folder and downloads Esri
+        // imagery into the offline folder (offlineStore). Files already there
+        // are skipped, so running the same download again resumes an
+        // interrupted one.
         const OFFLINE_IMAGERY_CONCURRENCY = 4;
 
         function initOfflinePanel() {
@@ -2025,44 +1919,100 @@ TABS.map_generator.initialize = function (callback) {
             $('#mapgen_offline_dir').text(offlineStore.dir());
         }
 
-        async function refreshOfflinePresent() {
-            if (!offlineStore.available()) return;
-            offlinePresent = {
-                srtm: await offlineStore.elevationNames('srtm'),
-                copernicus: await offlineStore.elevationNames('copernicus'),
-            };
-            offlinePresentGen++;
+        // ── Terrain folder ──────────────────────────────────────────
+        // Where .TER files are kept (js/terrain_library.js), shared with
+        // Mission Control. Sync and Export take their files from here.
+        async function refreshTerrainFiles() {
+            if (!terrainLibraryAvailable()) return;
+            let listing = null;
+            try {
+                listing = await listTerrain();
+            } catch (_) {
+                listing = null;
+            }
+            terrainFiles = listing ? listing.files : new Map();
+            terrainFilesGen++;
+            terrainFree = await globalThis.electronAPI.diskFree(terrainFolderDir()) ?? null;
+
+            const dir = terrainFolderDir();
+            $('#mapgen_terrain_folder_path').text(terrainFolderIsDefault() ? dir + ' (default)' : dir);
+            $('#mapgen_terrain_folder_default').toggle(!terrainFolderIsDefault());
+            let summary = 'No terrain files yet.';
+            if (listing && listing.count > 0) {
+                summary = `${listing.count.toLocaleString()} terrain file${listing.count > 1 ? 's' : ''}, ${formatBytes(listing.bytes)}.`;
+                const other = listing.unlabelled + listing.outdated;
+                if (other > 0) {
+                    summary += ` ${other.toLocaleString()} unlabelled or from an older version (amber on the map).`;
+                }
+            }
+            $('#mapgen_terrain_folder_info').text(summary);
         }
 
-        // A cell is ready offline when its own file and the E/N/NE neighbour
-        // files its edges are filled from are all in the folder.
-        function cellReadyOffline(source, lat, lon) {
-            if (!hasCellFile(source, lat, lon)) return false;
-            return withNeighbours([{ lat, lon }], source).every(c =>
-                !hasCellFile(source, c.lat, c.lon) || offlinePresent[source].has(elevationFileName(source, c.lat, c.lon)));
+        function terrainPresent() {
+            return new Set(terrainFiles.keys());
+        }
+
+        // A file was built (here or in Mission Control) or another folder was chosen.
+        async function terrainFolderChanged() {
+            await refreshTerrainFiles();
+            if (isTerrainMode()) updateTerrainGrid();
+        }
+
+        $('#mapgen_terrain_folder_choose').on('click', async (e) => {
+            e.preventDefault();
+            // From the default folder the dialog starts one level up, where
+            // "New folder" makes a folder for another area.
+            const startIn = terrainFolderIsDefault() ? terrainFolderParentDir() : terrainFolderDir();
+            await globalThis.electronAPI.ensureFolder(startIn);
+            const result = await globalThis.electronAPI.showOpenDialog({
+                title: 'Select the folder to keep terrain files (.TER) in',
+                defaultPath: startIn,
+                properties: ['openDirectory', 'createDirectory'],
+            });
+            if (result.canceled || !result.filePaths?.length) return;
+            setTerrainFolder(result.filePaths[0]);      // comes back through terrainFolderChanged
+        });
+
+        $('#mapgen_terrain_folder_open').on('click', async (e) => {
+            e.preventDefault();
+            const err = await globalThis.electronAPI.openFolder(terrainFolderDir());
+            if (err) $('#mapgen_status').text('Could not open the terrain folder: ' + err);
+        });
+
+        $('#mapgen_terrain_folder_default').on('click', (e) => {
+            e.preventDefault();
+            setTerrainFolder(null);
+        });
+
+        if (terrainLibraryAvailable()) {
+            forgetTerFiles();       // files may have been copied into the folder outside the app
+            if (stopTerrainListening) stopTerrainListening();
+            stopTerrainListening = onTerrainChange(() => { void terrainFolderChanged(); });
         }
 
         async function updateOfflineSizes() {
             if (!offlineStore.available()) return;
+            // elevation/... holds raw downloads kept by earlier versions. Nothing
+            // reads them any more: they are listed only so they can be cleared.
             const parts = [
-                ['elevation/copernicus', 'Copernicus'],
-                ['elevation/srtm', 'SRTM'],
-                ['imagery', 'Imagery'],
+                ['imagery', 'Imagery', ''],
+                ['elevation/copernicus', 'Old Copernicus downloads', ' (no longer used)'],
+                ['elevation/srtm', 'Old SRTM downloads', ' (no longer used)'],
             ];
             const rows = [];
-            for (const [rel, label] of parts) {
+            for (const [rel, label, note] of parts) {
                 const s = await globalThis.electronAPI.dirSize(offlineStore.path(rel));
                 if (!s?.files) continue;
-                rows.push(`<div>${label}: ${s.files.toLocaleString()} file${s.files > 1 ? 's' : ''}, ${formatBytes(s.bytes)}` +
+                rows.push(`<div>${label}: ${s.files.toLocaleString()} file${s.files > 1 ? 's' : ''}, ${formatBytes(s.bytes)}${note}` +
                     `<a href="#" class="mapgen-offline-clear" data-rel="${rel}" data-label="${label}">Clear</a></div>`);
             }
             $('#mapgen_offline_sizes').html(rows.length
-                ? '<div class="mapgen-offline-estimate-title">Already in the folder</div>' + rows.join('')
-                : 'The folder has no offline data yet.');
+                ? '<div class="mapgen-offline-estimate-title">In the offline data folder</div>' + rows.join('')
+                : 'The offline data folder has no imagery yet.');
         }
 
         async function refreshOfflineView() {
-            await refreshOfflinePresent();
+            await refreshTerrainFiles();
             offlineFree = await globalThis.electronAPI.diskFree(offlineStore.dir()) ?? null;
             if (isTerrainMode()) updateTerrainGrid();
             updateOfflineEstimate();
@@ -2070,8 +2020,8 @@ TABS.map_generator.initialize = function (callback) {
         }
 
         // ── Live size estimate ──────────────────────────────────────
-        // Shown in the panel and updated as the region, box, zoom, layers or
-        // elevation source change, so the size is known before Download.
+        // Shown in the panel and updated as the region, box, zoom or layers
+        // change, so the size is known before Download.
         // Coalesced to one render per 50 ms: dragging a box edge calls this on
         // every mouse move. A timer, not requestAnimationFrame, which stops
         // while the window is hidden.
@@ -2084,13 +2034,17 @@ TABS.map_generator.initialize = function (callback) {
             }, 50);
         }
 
-        // The elevation part of the plan, cached: for a big region it walks
-        // tens of thousands of cells (~100 ms for the globe), and it only
-        // changes with the area, the source or the folder's contents.
-        function offlineElevationPlan(area) {
-            const key = JSON.stringify([area.bounds, offlinePresentGen]);
+        // The terrain part of the plan, cached: for a big region it walks tens
+        // of thousands of cells (~100 ms for the globe), and it only changes
+        // with the area or the terrain folder's contents. A drawn box gets a
+        // sea-level file for an all-sea cell; a region leaves those out.
+        function offlineTerrainPlan(area) {
+            const key = JSON.stringify([area.bounds, area.isBox, terrainFilesGen]);
             if (offlineElevationMemo.key !== key) {
-                offlineElevationMemo = { key, plan: planDownload({ cells: area.cells, present: offlinePresent, imagery: null }) };
+                offlineElevationMemo = {
+                    key,
+                    plan: planDownload({ cells: area.cells, present: terrainPresent(), includeSea: area.isBox, imagery: null }),
+                };
             }
             return offlineElevationMemo.plan;
         }
@@ -2117,32 +2071,36 @@ TABS.map_generator.initialize = function (callback) {
                 return;
             }
 
-            const source = getTerrainSource();
-            const sourceName = { srtm: 'SRTM', copernicus: 'Copernicus' }[source];
             const zMax = Number.parseInt($('#mapgen_offline_zoom').val(), 10);
             const imagery = zMax >= 0 && layers.length ? imageryTotalsByZoom(area.bounds, layers, zMax)[zMax] : null;
-            const plan = offlineElevationPlan(area);
-            const el = plan.elevation[source];
+            const plan = offlineTerrainPlan(area);
+            const ter = plan.terrain;
             const imageryBytes = imagery?.bytes || 0;
-            const needBytes = el.missingBytes + imageryBytes;
-            const tooBig = offlineFree !== null && offlineFree < needBytes;
+            const downloadBytes = ter.downloadBytes + imageryBytes;
+            const terrainTooBig = terrainFree !== null && terrainFree < ter.terBytes;
+            const imageryTooBig = offlineFree !== null && offlineFree < imageryBytes;
 
             const row = (label, value, cls = '') => `<div class="mapgen-offline-estimate-row ${cls}"><span>${label}</span><span>${value}</span></div>`;
             let html = '<div class="mapgen-offline-estimate-title">This download</div>';
-            html += row(`Elevation (${sourceName}):`, el.files === 0
+            html += row('Terrain files:', ter.files === 0
                 ? 'none needed (sea)'
-                : el.missing.length === 0
-                    ? `all ${el.files.toLocaleString()} files in folder`
-                    : `${formatBytes(el.missingBytes)}, ${el.missing.length.toLocaleString()} of ${el.files.toLocaleString()} files`);
+                : ter.missing.length === 0
+                    ? `all ${ter.files.toLocaleString()} in the terrain folder`
+                    : `${ter.missing.length.toLocaleString()} of ${ter.files.toLocaleString()} to build, ${formatBytes(ter.terBytes)} on disk`);
+            html += row('Elevation download:', ter.downloadBytes > 0 ? `about ${formatBytes(ter.downloadBytes)} (not kept)` : 'none');
             html += row('Imagery:', imagery
                 ? `up to ${formatBytes(imageryBytes)}, ${(imagery.tiles * layers.length).toLocaleString()} tiles`
                 : 'none');
-            html += row('Total:', `up to ${formatBytes(needBytes)}`, 'mapgen-offline-estimate-total');
-            if (offlineFree !== null) {
-                html += row('Free space:', formatBytes(offlineFree), tooBig ? 'mapgen-offline-warn' : '');
+            html += row('Total download:', `up to ${formatBytes(downloadBytes)}`, 'mapgen-offline-estimate-total');
+            if (terrainFree !== null && ter.terBytes > 0) {
+                html += row('Free (terrain folder):', formatBytes(terrainFree), terrainTooBig ? 'mapgen-offline-warn' : '');
             }
-            html += row('Time at 100 Mbit/s:', needBytes > 0 ? formatDuration(needBytes / 12.5e6) : '—');
-            html += row('.TER on SD card:', formatBytes(plan.terBytes[source]));
+            if (offlineFree !== null && imageryBytes > 0) {
+                html += row('Free (imagery):', formatBytes(offlineFree), imageryTooBig ? 'mapgen-offline-warn' : '');
+            }
+            // plan.seconds covers the terrain files (the plan was made without imagery)
+            html += row('Time at 100 Mbit/s:', downloadBytes > 0 || ter.missing.length > 0
+                ? formatDuration(plan.seconds + imageryBytes / 12.5e6) : '—');
             $est.html(html);
         }
 
@@ -2159,7 +2117,7 @@ TABS.map_generator.initialize = function (callback) {
             const r = regionById($('#mapgen_offline_region').val());
             if (r) {
                 return {
-                    name: r.name, cells: cellsForRange(r),
+                    name: r.name, cells: cellsForRange(r), isBox: false,
                     bounds: { south: r.lat0, west: r.lon0, north: r.lat1 + 1, east: r.lon1 + 1 },
                 };
             }
@@ -2167,7 +2125,7 @@ TABS.map_generator.initialize = function (callback) {
             if (!layer) return null;
             const b = layer.getBounds();
             return {
-                name: 'Drawn box', cells: boundsCells(b),
+                name: 'Drawn box', cells: boundsCells(b), isBox: true,
                 bounds: { south: b.getSouth(), west: b.getWest(), north: b.getNorth(), east: b.getEast() },
             };
         }
@@ -2182,65 +2140,64 @@ TABS.map_generator.initialize = function (callback) {
                 $('#mapgen_status').text('Draw a rectangle first, or pick a region in Offline Data.');
                 return;
             }
-            const source = getTerrainSource();
-            const other = source === 'srtm' ? 'copernicus' : 'srtm';
-            const sourceName = { srtm: 'NASA SRTM1', copernicus: 'Copernicus GLO-30' };
             const zMax = Number.parseInt($('#mapgen_offline_zoom').val(), 10);
             const layers = zMax >= 0 ? offlineLayers() : [];
 
-            await refreshOfflinePresent();
+            await refreshTerrainFiles();
             const plan = planDownload({
                 cells: area.cells,
-                present: offlinePresent,
+                present: terrainPresent(),
+                includeSea: area.isBox,
                 imagery: layers.length ? { ...area.bounds, zMax, layers } : null,
             });
-            const el = plan.elevation[source];
-            const elOther = plan.elevation[other];
+            const ter = plan.terrain;
             const imageryBytes = plan.imagery?.bytes || 0;
-            const needBytes = el.missingBytes + imageryBytes;
-            const free = await globalThis.electronAPI.diskFree(offlineStore.dir());
-            const tooBig = free !== null && free !== undefined && free < needBytes;
+            const downloadBytes = ter.downloadBytes + imageryBytes;
+            const freeImagery = await globalThis.electronAPI.diskFree(offlineStore.dir());
+            const terrainTooBig = terrainFree !== null && terrainFree < ter.terBytes;
+            const imageryTooBig = freeImagery !== null && freeImagery !== undefined && freeImagery < imageryBytes;
+            const tooBig = terrainTooBig || imageryTooBig;
 
             const esc = s => $('<span>').text(s).html();
+            const freeText = (free, short) => (free === null || free === undefined ? 'unknown'
+                : (short ? `<span class="mapgen-offline-warn">${formatBytes(free)} — not enough</span>` : formatBytes(free)));
             let html =
                 offlineInfoRow('Region:', esc(area.name)) +
-                offlineInfoRow('Folder:', `<span style="font-size:11px;">${esc(offlineStore.dir())}</span>`) +
-                offlineInfoRow('Elevation source:', sourceName[source]) +
-                offlineInfoRow('1° cells:', `${plan.cells.toLocaleString()} (${el.cells.toLocaleString()} with edge neighbours)`) +
-                offlineInfoRow('Elevation files:', `${el.files.toLocaleString()} · ${el.present.toLocaleString()} already in folder · ${el.missing.length.toLocaleString()} to download`) +
-                offlineInfoRow('Elevation download:', `${formatBytes(el.missingBytes)} (all files: ${formatBytes(el.totalBytes)})`) +
-                offlineInfoRow(`${sourceName[other]} instead:`, `${formatBytes(elOther.totalBytes)} for ${elOther.files.toLocaleString()} files`);
+                offlineInfoRow('Terrain folder:', `<span style="font-size:11px;">${esc(terrainFolderDir())}</span>`) +
+                offlineInfoRow('1° cells:', plan.cells.toLocaleString() + (ter.sea ? ` (${ter.sea.toLocaleString()} all sea, left out)` : '')) +
+                offlineInfoRow('Terrain files:', `${ter.files.toLocaleString()} · ${ter.present.toLocaleString()} already in the folder · ${ter.missing.length.toLocaleString()} to build`) +
+                offlineInfoRow('Terrain on disk:', `${formatBytes(ter.terBytes)} to add (all files: ${formatBytes(ter.totalTerBytes)})`) +
+                offlineInfoRow('Elevation download:', ter.downloadBytes > 0
+                    ? `about ${formatBytes(ter.downloadBytes)}; it is turned into .TER files and not kept` : 'none');
             if (plan.imagery) {
                 const names = { esri_satellite: 'satellite', esri_street: 'street', esri_labels: 'labels' };
                 html += offlineInfoRow('Imagery:', `Esri ${plan.imagery.layers.map(id => names[id]).join(' + ')}, zoom 0–${plan.imagery.zMax}`) +
-                    offlineInfoRow('Imagery tiles:', `${plan.imagery.files.toLocaleString()} files, about ${formatBytes(imageryBytes)} (tiles already saved are skipped)`);
+                    offlineInfoRow('Imagery tiles:', `${plan.imagery.files.toLocaleString()} files, about ${formatBytes(imageryBytes)} (tiles already saved are skipped)`) +
+                    offlineInfoRow('Imagery folder:', `<span style="font-size:11px;">${esc(offlineStore.dir())}</span>`);
             } else {
                 html += offlineInfoRow('Imagery:', 'none');
             }
-            html += offlineInfoRow('Total download:', `up to ${formatBytes(needBytes)}`) +
-                offlineInfoRow('Free space:', free === null || free === undefined ? 'unknown'
-                    : (tooBig ? `<span class="mapgen-offline-warn">${formatBytes(free)} — not enough</span>` : formatBytes(free))) +
-                offlineInfoRow('Time at 100 Mbit/s:', needBytes > 0 ? formatDuration(plan.seconds[source]) : '—') +
-                offlineInfoRow('.TER files if generated:', `${formatBytes(plan.terBytes[source])} (on the SD card, not in this folder)`);
+            html += offlineInfoRow('Total download:', `up to ${formatBytes(downloadBytes)}`);
+            if (ter.terBytes > 0) html += offlineInfoRow('Free (terrain folder):', freeText(terrainFree, terrainTooBig));
+            if (plan.imagery) html += offlineInfoRow('Free (imagery):', freeText(freeImagery, imageryTooBig));
+            html += offlineInfoRow('Time at 100 Mbit/s:', downloadBytes > 0 || ter.missing.length > 0 ? formatDuration(plan.seconds) : '—');
 
             const notes = [];
-            notes.push(source === 'copernicus'
-                ? esc(COPERNICUS_NOTICE_1) + '. ' + esc(COPERNICUS_NOTICE_2) + '.'
-                : 'NASA SRTM data is public domain. Outside 60°N–56°S this server only has coarse fill data.');
+            notes.push(esc(COPERNICUS_NOTICE_1) + '. ' + esc(COPERNICUS_NOTICE_2) + '.');
             if (plan.imagery) {
                 notes.push('Esri tiles are saved for your own offline use only; don\'t share or publish them.');
             }
-            notes.push(`Elevation data comes from public AWS buckets (index of ${CELL_INDEX_INFO.date}). Files download ${OFFLINE_ELEVATION_CONCURRENCY} at a time, imagery ${OFFLINE_IMAGERY_CONCURRENCY} at a time. Abort at any time; running the same download again picks up where it stopped.`);
+            notes.push(`Elevation data comes from public AWS buckets (index of ${CELL_INDEX_INFO.date}). Terrain files are built one at a time, imagery downloads ${OFFLINE_IMAGERY_CONCURRENCY} at a time. Abort at any time; running the same download again picks up where it stopped.`);
             html += `<div class="mapgen-offline-note">${notes.join('<br>')}</div>`;
 
-            const nothingToDo = el.missing.length === 0 && !plan.imagery;
+            const nothingToDo = ter.missing.length === 0 && !plan.imagery;
             if (nothingToDo) {
-                html += '<div class="mapgen-offline-note"><b>Everything for this area is already in the folder.</b></div>';
+                html += '<div class="mapgen-offline-note"><b>Every terrain file for this area is already in the folder.</b></div>';
             } else if (tooBig) {
                 html += '<div class="mapgen-offline-note mapgen-offline-warn">Not enough free space on that drive. Pick a smaller area, lower the imagery zoom, or choose another folder.</div>';
             }
 
-            offlineJob = { state: 'confirm', source, plan };
+            offlineJob = { state: 'confirm', plan };
             $('#mapgen_sync_info').html(html);
             $('#mapgen_modal_header').text('Download for Offline Use');
             $('#mapgen_progress_section').hide();
@@ -2264,11 +2221,32 @@ TABS.map_generator.initialize = function (callback) {
             }
         }
 
-        function offlineElevationItems(source, cells) {
-            return cells.map(c => {
-                const f = elevationFile(source, c.lat, c.lon);
-                return { kind: 'elevation', url: f.url, path: f.path, estBytes: cellFileBytes(source, c.lat, c.lon) };
-            });
+        // Builds terrain files into the terrain folder, one at a time
+        // (js/terrain_library.js). Pause takes effect between files.
+        async function runTerrainBuilds(cells, job) {
+            for (const cell of cells) {
+                while (job.paused && !job.aborted) await new Promise(r => setTimeout(r, 250));
+                if (job.aborted) return;
+                const item = { kind: 'terrain', cell, estBytes: cellBuildEstimate(cell.lat, cell.lon).downloadBytes };
+                job.current = terrainDatFilename(cell.lat, cell.lon);
+                const result = await buildTerrain([cell], {
+                    signal: job.controller.signal,
+                    onProgress: step => { job.stage = step.stage; },
+                });
+                job.current = null;
+                if (result.aborted) return;     // cut off by Abort, not a failure
+                job.done++;
+                job.leftBytes = Math.max(0, job.leftBytes - item.estBytes);
+                if (result.present.length) {
+                    job.skipped++;
+                } else if (result.built.length) {
+                    job.bytes += item.estBytes;
+                    job.downloaded++;
+                } else {
+                    item.error = result.failed[0]?.error || 'could not be built';
+                    job.failed.push(item);
+                }
+            }
         }
 
         // Runs `workers` downloads at a time from a shared iterator.
@@ -2307,7 +2285,8 @@ TABS.map_generator.initialize = function (callback) {
             const speed = now > t0 ? (job.bytes - b0) / ((now - t0) / 1000) : 0;
             const pct = job.total > 0 ? job.done / job.total * 100 : 100;
             $('#mapgen_progress_fill').css('width', pct + '%');
-            let text = `${job.done.toLocaleString()} / ${job.total.toLocaleString()} files · ${formatBytes(job.bytes)} downloaded`;
+            let text = `${job.done.toLocaleString()} / ${job.total.toLocaleString()} files · about ${formatBytes(job.bytes)} downloaded`;
+            if (job.current) text += ` · building ${job.current}${job.stage ? ' (' + job.stage + ')' : ''}`;
             if (job.paused) {
                 text += ' · Paused (files in progress finish first)';
             } else if (speed > 0) {
@@ -2317,14 +2296,15 @@ TABS.map_generator.initialize = function (callback) {
             $('#mapgen_download_status').text(text);
         }
 
-        async function runOfflineDownload(elevationItems, imageryIter, imageryCount) {
+        async function runOfflineDownload(terrainCells, imageryIter, imageryCount) {
             const job = offlineJob;
             Object.assign(job, {
-                state: 'running', paused: false, aborted: false,
-                total: elevationItems.length + imageryCount,
-                leftBytes: elevationItems.reduce((s, i) => s + i.estBytes, 0) + (imageryCount ? job.plan.imagery.bytes / job.plan.imagery.files * imageryCount : 0),
+                state: 'running', paused: false, aborted: false, controller: new AbortController(),
+                total: terrainCells.length + imageryCount,
+                leftBytes: terrainCells.reduce((s, c) => s + cellBuildEstimate(c.lat, c.lon).downloadBytes, 0) +
+                    (imageryCount ? job.plan.imagery.bytes / job.plan.imagery.files * imageryCount : 0),
                 done: 0, downloaded: 0, skipped: 0, notFound: 0, bytes: 0, failed: [],
-                samples: [],
+                samples: [], current: null, stage: null,
             });
 
             $('#mapgen_progress_section').show();
@@ -2335,7 +2315,7 @@ TABS.map_generator.initialize = function (callback) {
             const timer = setInterval(() => renderOfflineProgress(job), 500);
             try {
                 await Promise.all([
-                    runOfflineQueue(elevationItems[Symbol.iterator](), OFFLINE_ELEVATION_CONCURRENCY, job),
+                    runTerrainBuilds(terrainCells, job),
                     runOfflineQueue(imageryIter, OFFLINE_IMAGERY_CONCURRENCY, job),
                 ]);
             } finally {
@@ -2345,7 +2325,7 @@ TABS.map_generator.initialize = function (callback) {
 
             job.state = 'done';
             let summary = job.aborted ? 'Stopped. ' : 'Finished. ';
-            summary += `${job.downloaded.toLocaleString()} downloaded (${formatBytes(job.bytes)}), ${job.skipped.toLocaleString()} already in folder`;
+            summary += `${job.downloaded.toLocaleString()} done (${formatBytes(job.bytes)} downloaded), ${job.skipped.toLocaleString()} already there`;
             if (job.notFound) summary += `, ${job.notFound.toLocaleString()} not on the server`;
             if (job.failed.length) summary += `, ${job.failed.length.toLocaleString()} failed (first: ${job.failed[0].error})`;
             summary += '.';
@@ -2360,18 +2340,17 @@ TABS.map_generator.initialize = function (callback) {
             const job = offlineJob;
             if (job.state === 'confirm') {
                 const plan = job.plan;
-                const elevation = offlineElevationItems(job.source, plan.elevation[job.source].missing);
                 const imageryIter = plan.imagery ? offlineImageryItems(plan.imagery) : [][Symbol.iterator]();
-                await runOfflineDownload(elevation, imageryIter, plan.imagery?.files || 0);
+                await runOfflineDownload(plan.terrain.missing, imageryIter, plan.imagery?.files || 0);
             } else if (job.state === 'running') {
                 job.paused = !job.paused;
                 $('#mapgen_modal_confirm').text(job.paused ? 'Resume' : 'Pause');
                 renderOfflineProgress(job);
             } else if (job.state === 'done' && job.failed.length) {
                 const failed = job.failed;
-                const elevation = failed.filter(i => i.kind === 'elevation');
+                const terrainCells = failed.filter(i => i.kind === 'terrain').map(i => i.cell);
                 const imagery = failed.filter(i => i.kind === 'imagery');
-                await runOfflineDownload(elevation, imagery[Symbol.iterator](), imagery.length);
+                await runOfflineDownload(terrainCells, imagery[Symbol.iterator](), imagery.length);
             }
         }
 
@@ -2390,6 +2369,7 @@ TABS.map_generator.initialize = function (callback) {
             if (offlineJob?.state !== 'running') return;
             offlineJob.aborted = true;
             offlineJob.paused = false;
+            offlineJob.controller?.abort();
             void globalThis.electronAPI.abortDownloads();
         };
 
@@ -2432,6 +2412,9 @@ TABS.map_generator.initialize = function (callback) {
         });
 
         // ── Terrain sync pipeline ───────────────────────────────────
+        // The drawn box's .TER files are built into the terrain folder (files
+        // already there are kept), then copied to the SD card or zipped. The
+        // web version has no folder: it builds in memory and zips.
         async function showTerrainSyncModal() {
             const layer = drawnItems.getLayers()[0];
             if (!layer) {
@@ -2443,66 +2426,42 @@ TABS.map_generator.initialize = function (callback) {
             const bounds = layer.getBounds();
             const tiles = boundsCells(bounds);
             const fileList = tiles.map(t => terrainDatFilename(t.lat, t.lon));
-            const totalSizeMB = tiles.reduce((s, t) => s + estimateDatSizeMB(t.lat), 0).toFixed(0);
-
-            // Every land cell the run reads (each cell plus its E/N/NE
-            // neighbours), and how many are already in the IndexedDB cache or
-            // the offline folder. Sea cells need no data.
-            const copernicus = getTerrainSource() === 'copernicus';
-            const source = copernicus ? 'copernicus' : 'srtm';
-            const landCells = withNeighbours(tiles, source).filter(c => hasCellFile(source, c.lat, c.lon));
-            const cachedSetKeys = await hgtDb.cachedSet();
-            const folderNames = await offlineStore.elevationNames(source);
-            const cachePrefix = copernicus ? COPERNICUS_CACHE_PREFIX : '';
-            let cachedCount = 0;
-            landCells.forEach(c => {
-                if (cachedSetKeys.has(cachePrefix + cellKey(c)) || folderNames.has(elevationFileName(source, c.lat, c.lon))) {
-                    cachedCount++;
-                }
-            });
-            const plan = planDownload({ cells: tiles, present: { [source]: folderNames } });
-            const sourceUnit = copernicus ? 'GLO-30 tiles' : 'HGT tiles';
-            const totalHgt = landCells.length;
-            const cacheInfo = totalHgt === 0
-                ? 'None needed (sea)'
-                : cachedCount === totalHgt
-                    ? `<span style="color:#87b025;">Offline ready: all ${totalHgt} ${sourceUnit} cached \u2014 no download needed</span>`
-                    : `${cachedCount} of ${totalHgt} ${sourceUnit} cached; the rest needs internet ` +
-                      `(up to ${formatBytes(plan.elevation[source].missingBytes)})`;
+            const useFolder = terrainLibraryAvailable();
+            if (useFolder) await refreshTerrainFiles();
+            const plan = planDownload({ cells: tiles, present: useFolder ? terrainPresent() : null, includeSea: true, imagery: null });
+            const ter = plan.terrain;
+            const buildInfo = ter.missing.length === 0
+                ? `<span style="color:#87b025;">All ${ter.files} file(s) are in the terrain folder — no download needed</span>`
+                : `${useFolder ? `${ter.present} of ${ter.files} in the terrain folder; ` : ''}${ter.missing.length} to build ` +
+                  (ter.downloadBytes > 0 ? `(needs internet, about ${formatBytes(ter.downloadBytes)})` : '(sea level, no download)');
 
             const hasSD = !!sdPath;
+            const esc = s => $('<span>').text(s).html();
             let infoHtml = `
-                <div class="mapgen-info-row"><span>Target:</span><span>${terrainSourceLabel()}</span></div>
-                <div class="mapgen-info-row"><span>Terrain Files:</span><span>${tiles.length} .TER file(s)</span></div>
-                <div class="mapgen-info-row"><span>Est. Output:</span><span>~${totalSizeMB} MB</span></div>
-                <div class="mapgen-info-row"><span>Elevation Download:</span><span>${cacheInfo}</span></div>
+                <div class="mapgen-info-row"><span>Target:</span><span>INAV Terrain (.TER)</span></div>
+                <div class="mapgen-info-row"><span>Terrain Files:</span><span>${tiles.length} .TER file(s), ${formatBytes(ter.totalTerBytes)}</span></div>
+                <div class="mapgen-info-row"><span>To Build:</span><span>${buildInfo}</span></div>
                 <div class="mapgen-info-row"><span>Files:</span><span style="font-size:10px;">${fileList.join(', ')}</span></div>
             `;
-            if (hasSD) {
-                infoHtml += `<div class="mapgen-info-row"><span>SD Path:</span><span style="font-size:11px;">${$('<span>').text(sdPath).html()}</span></div>`;
-                infoHtml += `<div style="margin:6px 0; font-size:11px; color:#888;">\u26a0\ufe0f FREESPAC.E will be auto-deleted from SD card during sync. INAV will recreate it on next boot.</div>`;
-            } else {
-                infoHtml += `<div style="margin:6px 0; font-size:11px; color:#888;">\u26a0\ufe0f Delete FREESPAC.E from the SD card before copying. INAV will recreate it on next boot.</div>`;
+            if (useFolder) {
+                infoHtml += `<div class="mapgen-info-row"><span>Terrain Folder:</span><span style="font-size:11px;">${esc(terrainFolderDir())}</span></div>`;
             }
-            infoHtml += copernicus
-                ? `<div style="font-size:12px; color:#888; line-height:1.5;">Source: Copernicus GLO-30 (WorldDEM-30), 30m<br>` +
-                  `<span style="font-size:9px; color:#777;">${$('<span>').text(COPERNICUS_NOTICE_1).html()}. ${$('<span>').text(COPERNICUS_NOTICE_2).html()}.</span></div>`
-                : `<div style="font-size:12px; color:#888; line-height:1.5;">Source: NASA SRTM 30m elevation data (public domain)</div>`;
+            if (hasSD) {
+                infoHtml += `<div class="mapgen-info-row"><span>SD Path:</span><span style="font-size:11px;">${esc(sdPath)}</span></div>`;
+                infoHtml += `<div style="margin:6px 0; font-size:11px; color:#888;">⚠️ FREESPAC.E will be auto-deleted from SD card during sync. INAV will recreate it on next boot.</div>`;
+            } else {
+                infoHtml += `<div style="margin:6px 0; font-size:11px; color:#888;">⚠️ Delete FREESPAC.E from the SD card before copying. INAV will recreate it on next boot.</div>`;
+            }
+            infoHtml += `<div style="font-size:12px; color:#888; line-height:1.5;">Source: Copernicus GLO-30 (WorldDEM-30), 30m; NASA SRTM where Copernicus has no data<br>` +
+                `<span style="font-size:9px; color:#777;">${esc(COPERNICUS_NOTICE_1)}. ${esc(COPERNICUS_NOTICE_2)}.</span></div>`;
 
             $('#mapgen_sync_info').html(infoHtml);
             $('#mapgen_modal_header').text('INAV Terrain Generator');
             $('#mapgen_progress_section').hide();
             $('#mapgen_modal_actions').show();
-            $('#mapgen_modal_confirm').show().text(hasSD ? 'Generate & Sync' : 'Generate & Download ZIP');
+            $('#mapgen_modal_confirm').show().text(hasSD ? 'Build & Sync' : 'Build & Download ZIP');
             $('#mapgen_modal_cancel').text('Cancel');
             showModal();
-        }
-
-        // Ends a generation run that hit an error before anything was written.
-        function stopTerrainRun(err) {
-            $('#mapgen_download_status').text(`❌ ${err.message}. Generation stopped — no files were written.`);
-            $('#mapgen_modal_cancel').text('Close');
-            $('#mapgen_modal_confirm').hide();
         }
 
         async function terrainGenerateAndSync() {
@@ -2510,132 +2469,86 @@ TABS.map_generator.initialize = function (callback) {
             if (!layer) return;
 
             syncAborted = false;
-            const bounds = layer.getBounds();
-            const tiles = boundsCells(bounds);
-            const totalTiles = tiles.length;
-            let completed = 0;
-            const datFiles = [];
-            const terrainIo = makeTerrainIo();
-            const hgtCache = {};
-            const copernicusImages = {};
-            const startTime = Date.now();
+            const tiles = boundsCells(layer.getBounds());
             const hasSD = !!sdPath;
             const forceOverwrite = $('#mapgen_overwrite').is(':checked');
+            const controller = new AbortController();
+            terrainRunController = controller;
 
             // Switch to progress view
-            $('#mapgen_modal_header').text('Generating Terrain Files...');
+            $('#mapgen_modal_header').text('Building Terrain Files...');
             $('#mapgen_modal_confirm').hide();
             $('#mapgen_modal_cancel').text('Abort');
             $('#mapgen_progress_section').show();
             $('#mapgen_progress_fill').css('width', '0%');
             $('#mapgen_download_status').text('Starting...');
 
-            for (let ti = 0; ti < tiles.length; ti++) {
-                if (syncAborted) break;
-                const tile = tiles[ti];
-                const name = srtmTileName(tile.lat, tile.lon);
-                const prefix = `Tile ${completed + 1}/${totalTiles}: `;
-                const primaryKey = tile.lat + '_' + tile.lon;
-                let cellCache = hgtCache;
-                const isCopernicus = getTerrainSource() === 'copernicus';
+            const stageText = {
+                queued: 'waiting', downloading: 'downloading elevation data', decoding: 'reading elevation data',
+                grid: 'reading elevation data', edges: 'reading the edges', packing: 'converting', writing: 'saving',
+            };
+            const showStep = (index, name, stage, done, of) => {
+                const part = stage === 'packing' && of ? done / of : (stage === 'writing' ? 1 : 0);
+                $('#mapgen_progress_fill').css('width', ((index + part) / tiles.length * 100).toFixed(0) + '%');
+                const pct = (stage === 'packing' || stage === 'grid') && of ? ` (${Math.round(done / of * 100)}%)` : '';
+                $('#mapgen_download_status').text(`File ${index + 1}/${tiles.length}: ${name} — ${stageText[stage] || stage}${pct}`);
+            };
 
-                if (isCopernicus) {
+            // files: what goes to the card or the ZIP, in box order. `data` is
+            // only set in the web version; the desktop app reads the folder.
+            let files = [];
+            let notBuilt = [];      // [{ name, error }]: a cell that fails does not stop the others
+            if (terrainLibraryAvailable()) {
+                const result = await buildTerrain(tiles, {
+                    signal: controller.signal,
+                    onProgress: step => showStep(step.index, step.name, step.stage, step.done, step.of),
+                });
+                if (result.aborted || syncAborted) return;
+                notBuilt = result.failed.map(f => ({ name: f.name, error: f.error }));
+                const bad = new Set(notBuilt.map(f => f.name));
+                files = tiles.map(t => ({ name: terrainDatFilename(t.lat, t.lon) })).filter(f => !bad.has(f.name));
+            } else {
+                const imgCache = {};
+                for (let index = 0; index < tiles.length; index++) {
+                    if (syncAborted) return;
+                    const tile = tiles[index];
+                    const name = terrainDatFilename(tile.lat, tile.lon);
                     try {
-                        cellCache = await ensureCopernicusCellData(tile.lat, tile.lon, hgtCache, copernicusImages, (stage, a, b) => {
-                            const msg = stage === 'downloading' ? `⬇️ Downloading ${name} (Copernicus)...`
-                                : stage === 'decoding' ? `📦 Decoding ${name} (${(a / 1048576).toFixed(1)} MB)...`
-                                    : stage === 'edges' ? `🧩 Fetching ${name} edge data...`
-                                        : `🧮 Building ${name} grid (${Math.round(a / b * 100)}%)`;
-                            $('#mapgen_download_status').text(prefix + msg);
-                        }, terrainIo);
-                    } catch (e) {
-                        if (syncAborted) break;
-                        console.warn(`Copernicus fetch failed for ${name}:`, e.message);
-                        if (e instanceof MissingElevationError) {
-                            showCopernicusFallbackPrompt(e);
-                        } else {
-                            stopTerrainRun(e);
-                        }
-                        return;
-                    }
-                    if (!cellCache) {
-                        $('#mapgen_download_status').text(prefix + `⚠️ No Copernicus data for ${name} (outside coverage). Skipping.`);
-                        completed++;
-                        continue;
-                    }
-                }
-
-                // SRTM: the cell and its E/N/NE neighbours, from the caches, the
-                // offline folder or the server. Data that exists but can't be had
-                // stops the run: a missing grid would come out as sea level.
-                if (!isCopernicus) {
-                    try {
-                        await ensureSrtmCellData(tile.lat, tile.lon, hgtCache, terrainIo, stage => {
-                            const msg = stage === 'cached' ? '✅ Cached ' + name
-                                : stage === 'local' ? '✅ From offline folder: ' + name
-                                    : stage === 'connecting' ? '⬇️ Connecting to SRTM server...'
-                                        : stage === 'downloading' ? `⬇️ Downloading ${name}.hgt.gz...`
-                                            : stage === 'downloaded' ? `✅ Downloaded ${name}`
-                                                : `📦 Decompressing ${name}...`;
-                            $('#mapgen_download_status').text(prefix + msg);
+                        const built = await buildCellTer(tile.lat, tile.lon, {
+                            imgCache,
+                            signal: controller.signal,
+                            onStage: (stage, done, of) => showStep(index, name, stage, done, of),
                         });
+                        pruneImageCache(imgCache);
+                        files.push({ name, data: built.bytes });
                     } catch (e) {
-                        if (syncAborted) break;
-                        console.warn(`SRTM data missing for ${name}:`, e.message);
-                        stopTerrainRun(e);
-                        return;
+                        if (e?.name === 'AbortError' || syncAborted) return;
+                        notBuilt.push({ name, error: String(e?.message || e) });
                     }
                 }
-
-                // Convert elevation grid → .TER
-                $('#mapgen_download_status').text(prefix + `\u2699\ufe0f Converting ${name} to .TER...`);
-                try {
-                    const datData = await createDatFromHgt(tile.lat, tile.lon, cellCache, (done, total) => {
-                        const pct = ((completed + done / total) / totalTiles * 100).toFixed(0);
-                        $('#mapgen_progress_fill').css('width', pct + '%');
-                        $('#mapgen_download_status').text(prefix + `\u2699\ufe0f Converting ${name} (${Math.round(done / total * 100)}%)`);
-                    });
-                    datFiles.push({ name: terrainDatFilename(tile.lat, tile.lon), data: datData });
-                    $('#mapgen_download_status').text(prefix + `\u2705 ${terrainDatFilename(tile.lat, tile.lon)} (${(datData.length / 1048576).toFixed(1)} MB)`);
-                } catch (e) {
-                    // A conversion failure (e.g. the packer's self-check) stops the
-                    // whole run. Writing an incomplete tile set and reporting success
-                    // would silently leave the FC without terrain for that square.
-                    console.warn(`Conversion failed for ${name}:`, e.message);
-                    $('#mapgen_download_status').text(
-                        `❌ ${terrainDatFilename(tile.lat, tile.lon)} could not be generated: ${e.message}. ` +
-                        'Generation stopped — no files were written.');
-                    $('#mapgen_modal_cancel').text('Close');
-                    $('#mapgen_modal_confirm').hide();
-                    return;
-                }
-                completed++;
             }
 
-            // Share downloaded HGT tiles with live altitude readout
-            Object.keys(hgtCache).forEach(k => { liveAltCache[k] = hgtCache[k]; });
-            updateHgtCacheInfo();
-
-            if (syncAborted || datFiles.length === 0) {
-                if (datFiles.length === 0) {
-                    $('#mapgen_download_status').text('No files generated.');
-                    $('#mapgen_modal_cancel').text('Close');
-                    $('#mapgen_modal_confirm').hide();
-                }
+            if (notBuilt.length) console.warn('Terrain files that could not be built:', notBuilt);
+            if (files.length === 0) {
+                $('#mapgen_download_status').text(notBuilt.length
+                    ? `❌ No file could be built. ${notBuilt[0].name}: ${notBuilt[0].error}`
+                    : 'No files built.');
+                $('#mapgen_modal_cancel').text('Close');
+                $('#mapgen_modal_confirm').hide();
                 return;
             }
 
-            // Write to SD or download as ZIP
+            // Copy to the SD card or download as ZIP
             if (hasSD) {
-                await writeTerrainToSD(datFiles, forceOverwrite);
+                await writeTerrainToSD(files, forceOverwrite, notBuilt, controller.signal);
             } else {
-                await downloadTerrainZip(datFiles);
+                await downloadTerrainZip(files, notBuilt);
             }
         }
 
-        async function writeTerrainToSD(datFiles, forceOverwrite) {
+        async function writeTerrainToSD(files, forceOverwrite, notBuilt, signal) {
             $('#mapgen_modal_header').text('Writing to SD Card...');
-            $('#mapgen_download_status').text('Writing to SD card: 0 / ' + datFiles.length + '...');
+            $('#mapgen_download_status').text('Writing to SD card: 0 / ' + files.length + '...');
             $('#mapgen_progress_fill').css('width', '0%');
 
             // Try to delete FREESPAC.E
@@ -2643,96 +2556,83 @@ TABS.map_generator.initialize = function (callback) {
                 await globalThis.electronAPI.rm(sdPath + '/FREESPAC.E');
             } catch (_) { /* OK */ }
 
-            const startTime = Date.now();
-            const total = datFiles.length;
-            let processed = 0;
-            let failedCount = 0;
-            let skipped = 0;
-            const totalBytes = datFiles.reduce((s, f) => s + f.data.length, 0);
-            let writtenBytes = 0;
-
-            for (let i = 0; i < datFiles.length; i++) {
-                if (syncAborted) break;
-                const df = datFiles[i];
-                const fullPath = sdPath + '/' + df.name;
-                try {
-                    if (!forceOverwrite) {
-                        const exists = await tileExistsOnSD(fullPath);
-                        if (exists) {
-                            skipped++;
-                            writtenBytes += df.data.length;
-                            processed++;
-                            const pct = totalBytes > 0 ? (writtenBytes / totalBytes * 100) : 0;
-                            $('#mapgen_progress_fill').css('width', pct.toFixed(0) + '%');
-                            $('#mapgen_download_status').text(`Skipped (exists): ${df.name}`);
-                            continue;
-                        }
-                    }
-                    await globalThis.electronAPI.writeFile(fullPath, df.data);
-                    writtenBytes += df.data.length;
-                    const pct = totalBytes > 0 ? (writtenBytes / totalBytes * 100) : 0;
-                    $('#mapgen_progress_fill').css('width', pct.toFixed(0) + '%');
-                    const elapsed = Date.now() - startTime;
-                    if (writtenBytes > 0 && elapsed > 500) {
-                        const remainMs = Math.max(0, elapsed / writtenBytes * (totalBytes - writtenBytes));
-                        const mins = Math.floor(remainMs / 60000);
-                        const secs = Math.ceil((remainMs % 60000) / 1000);
-                        const speed = (writtenBytes / 1024 / (elapsed / 1000)).toFixed(0);
-                        $('#mapgen_download_status').text(`Writing ${df.name}... ${pct.toFixed(0)}% (${speed} KB/s, ${mins}:${secs.toString().padStart(2, '0')} remaining)`);
-                    }
-                } catch (e) {
-                    failedCount++;
-                    console.warn(`Failed: ${df.name}: ${e.message}`);
-                }
-                processed++;
-            }
-
+            // A file of the same size already on the card is left alone unless
+            // Force Overwrite is ticked.
+            const names = files.map(f => f.name);
+            const result = await copyTerrainTo(names, sdPath, {
+                overwrite: forceOverwrite,
+                signal,
+                onProgress: step => {
+                    $('#mapgen_progress_fill').css('width', (step.index / step.total * 100).toFixed(0) + '%');
+                    $('#mapgen_download_status').text(`Writing ${step.name} (${step.index + 1} of ${step.total})...`);
+                },
+            });
             if (syncAborted) return;
-            showTerrainComplete(total, failedCount, skipped, true);
+            for (const failure of result.failed) console.warn(`Failed: ${failure.name}: ${failure.error}`);
+            showTerrainComplete(names.length, result.failed.length, result.skipped.length, true, notBuilt);
         }
 
-        async function downloadTerrainZip(datFiles) {
+        async function downloadTerrainZip(files, notBuilt) {
             $('#mapgen_download_status').text('Creating ZIP...');
             $('#mapgen_progress_fill').css('width', '0%');
 
-            const copernicus = getTerrainSource() === 'copernicus';
             const zip = new JSZip();
-            for (const df of datFiles) {
-                zip.file(df.name, df.data);
+            let added = 0;
+            for (const f of files) {
+                let data = f.data;
+                if (!data) {
+                    const read = await globalThis.electronAPI.readFile(terrainFilePath(f.name), null);
+                    data = read && !read.error && read.data ? read.data : null;
+                }
+                if (!data) {
+                    notBuilt.push({ name: f.name, error: 'could not be read from the terrain folder' });
+                    continue;
+                }
+                zip.file(f.name, data);
+                added++;
             }
-            if (copernicus) zip.file('NOTICE.txt', copernicusNoticeText());
+            zip.file(TERRAIN_NOTICE_FILE, terrainNoticeText());
 
             const blob = await zip.generateAsync({ type: 'arraybuffer' });
             const result = await globalThis.electronAPI.showSaveDialog({
                 title: 'Save Terrain Files ZIP',
-                defaultPath: copernicus ? 'INAV_Terrain_Copernicus.zip' : 'INAV_Terrain_SRTM.zip',
+                defaultPath: 'INAV_Terrain.zip',
                 filters: [{ name: 'ZIP Archive', extensions: ['zip'] }],
             });
             if (!result.canceled && result.filePath) {
                 await globalThis.electronAPI.writeFile(result.filePath, new Uint8Array(blob));
             }
-            showTerrainComplete(datFiles.length, 0, 0, false);
+            showTerrainComplete(added, 0, 0, false, notBuilt);
         }
 
-        function showTerrainComplete(total, failedCount, skipped, isSD) {
+        function showTerrainComplete(total, failedCount, skipped, isSD, notBuilt = []) {
             skipped = skipped || 0;
+            const esc = s => $('<span>').text(s).html();
+            const notBuiltText = notBuilt.length
+                ? `${notBuilt.length} file(s) could not be built: ${notBuilt.map(f => f.name).join(', ')} (${notBuilt[0].error})`
+                : '';
             if (failedCount > 0) {
-                $('#mapgen_download_status').text(`Done with ${failedCount} error(s).${skipped > 0 ? ` ${skipped} skipped (already existed).` : ''}`);
+                $('#mapgen_download_status').text(`Done with ${failedCount} error(s).${skipped > 0 ? ` ${skipped} skipped (already existed).` : ''}${notBuiltText ? ' ' + notBuiltText + '.' : ''}`);
             } else {
                 const written = total - skipped;
                 let summary = `${written} .TER file(s) written`;
                 if (skipped > 0) summary += `, ${skipped} skipped (already existed)`;
 
-                const title = isSD ? 'Terrain Sync Complete!' : 'Terrain Generation Complete!';
-                const msg = isSD ? 'All terrain files synced to SD card!' : 'All terrain files generated!';
+                const complete = notBuilt.length === 0;
+                const title = complete
+                    ? (isSD ? 'Terrain Sync Complete!' : 'Terrain Generation Complete!')
+                    : 'Terrain Files Incomplete';
+                const msg = complete
+                    ? (isSD ? 'All terrain files synced to SD card!' : 'All terrain files generated!')
+                    : esc(notBuiltText);
                 $('#mapgen_modal_header').text(title);
                 $('#mapgen_sync_info').html(`
                     <div class="mapgen-info-row"><span>Files:</span><span>${summary}</span></div>
-                    <div style="margin:18px 0; text-align:center; color:#87b025; font-size:16px; font-weight:bold;">${msg}</div>
+                    <div style="margin:18px 0; text-align:center; color:${complete ? '#87b025' : '#ff9800'}; font-size:${complete ? 16 : 13}px; font-weight:bold;">${msg}</div>
                     <div style="text-align:center; color:#888; font-size:12px;">Enable terrain in INAV CLI:<br><code style="color:#ffb300;">set terrain_enabled = ON</code> then <code style="color:#ffb300;">save</code></div>
                 `);
                 $('#mapgen_progress_section').hide();
-                $('#mapgen_download_status').text(`${isSD ? 'Sync' : 'Export'} complete! ${summary}`);
+                $('#mapgen_download_status').text(`${isSD ? 'Sync' : 'Export'} ${complete ? 'complete' : 'finished with files missing'}! ${summary}`);
             }
             $('#mapgen_modal_actions').show();
             $('#mapgen_modal_confirm').hide();
@@ -2756,5 +2656,9 @@ TABS.map_generator.initialize = function (callback) {
 TABS.map_generator.cleanup = function (callback) {
     // Leaving the tab stops an offline download; running it again resumes.
     if (stopOfflineDownload) stopOfflineDownload();
+    if (stopTerrainListening) {
+        stopTerrainListening();
+        stopTerrainListening = null;
+    }
     if (callback) callback();
 };

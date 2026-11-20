@@ -2,10 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-    cellIndex, cellFileBytes, hasCellFile, CELL_INDEX_INFO,
-    cellsForBounds, cellsForRange, withNeighbours, wrapLon,
+    cellIndex, cellFileBytes, hasCellFile, terSourceForCell, cellBuildEstimate, CELL_INDEX_INFO,
+    cellsForBounds, cellsForRange, wrapLon,
     REGIONS, regionById, lonToTileX, latToTileY, tileRanges, tilesInRanges,
-    elevationFile, elevationFileName, imageryLocalPath, imageryTotalsByZoom, planDownload, formatBytes, formatDuration,
+    imageryLocalPath, imageryTotalsByZoom, planDownload, formatBytes, formatDuration,
 } from '../js/offline_regions.js';
 
 const keys = cells => cells.map(c => `${c.lat}_${c.lon}`);
@@ -33,6 +33,43 @@ test('index knows land from sea for Copernicus', () => {
     assert.ok(hasCellFile('srtm', 30, -40));              // SRTM has a (sea-level) file everywhere
 });
 
+test('terSourceForCell: Copernicus for land, SRTM for the land it leaves out, null for sea', () => {
+    assert.equal(terSourceForCell(47, 8), 'copernicus');        // Switzerland
+    assert.equal(terSourceForCell(-34, 151), 'copernicus');     // Sydney coast
+    assert.equal(terSourceForCell(40, 44), 'srtm');             // Yerevan
+    assert.equal(terSourceForCell(40, 49), 'srtm');             // Baku
+    assert.equal(terSourceForCell(40, 50), 'srtm');             // Absheron peninsula, a small SRTM file
+    assert.equal(terSourceForCell(0, -140), null);              // Pacific
+    // Open ocean whose SRTM file is large (sea-floor depths), outside the left-out box
+    assert.ok(cellFileBytes('srtm', -43, 42) > 5e6);
+    assert.equal(terSourceForCell(-43, 42), null);
+    // Every cell without a Copernicus file is sea except those in the box
+    let srtmCells = 0;
+    for (let lat = -90; lat <= 89; lat++) {
+        for (let lon = -180; lon <= 179; lon++) {
+            if (terSourceForCell(lat, lon) === 'srtm') srtmCells++;
+        }
+    }
+    assert.equal(srtmCells, 25);
+});
+
+test('cellBuildEstimate: what a build downloads and how big the file is', () => {
+    const land = cellBuildEstimate(47, 8);
+    assert.equal(land.source, 'copernicus');
+    assert.equal(land.downloadBytes, Math.round(cellFileBytes('copernicus', 47, 8) * 1.5));
+    assert.ok(land.terBytes > 27e6 && land.terBytes < 30e6);
+
+    const leftOut = cellBuildEstimate(40, 44);
+    assert.equal(leftOut.source, 'srtm');
+    assert.equal(leftOut.downloadBytes, cellFileBytes('srtm', 40, 44) + cellFileBytes('srtm', 40, 45) +
+        cellFileBytes('srtm', 41, 44) + cellFileBytes('srtm', 41, 45));
+
+    const sea = cellBuildEstimate(0, -140);
+    assert.deepEqual([sea.source, sea.downloadBytes], ['sea', 0]);
+    assert.ok(sea.terBytes > 42e6 && sea.terBytes < 43e6);      // a sea-level file is full size
+    assert.equal(cellBuildEstimate(-34, 150).terBytes, 35553280);
+});
+
 test('cellsForBounds picks floor() cells, across the 0° lines', () => {
     assert.deepEqual(keys(cellsForBounds(-0.5, -0.5, 0.5, 0.5)), ['-1_-1', '-1_0', '0_-1', '0_0']);
     assert.deepEqual(keys(cellsForBounds(42.2, -72.8, 42.9, -72.1)), ['42_-73']);
@@ -44,19 +81,6 @@ test('cellsForBounds wraps past the 180° meridian', () => {
     assert.equal(cellsForBounds(0.1, -400, 0.2, 400).length, 360);
     assert.equal(wrapLon(180), -180);
     assert.equal(wrapLon(-181), 179);
-});
-
-test('withNeighbours adds E, N and NE once, wraps east and stops at 89°N', () => {
-    assert.deepEqual(keys(withNeighbours([{ lat: 42, lon: -72 }])), ['42_-72', '42_-71', '43_-72', '43_-71']);
-    assert.deepEqual(keys(withNeighbours([{ lat: 10, lon: 179 }])), ['10_179', '10_-180', '11_179', '11_-180']);
-    assert.deepEqual(keys(withNeighbours([{ lat: 89, lon: 0 }])), ['89_0', '89_1']);
-    assert.equal(withNeighbours(cellsForRange({ lat0: 0, lat1: 1, lon0: 0, lon1: 1 })).length, 9);
-});
-
-test('Copernicus also needs the S and SE neighbours, except at 90°S', () => {
-    assert.deepEqual(keys(withNeighbours([{ lat: 42, lon: -72 }], 'copernicus')),
-        ['42_-72', '42_-71', '43_-72', '43_-71', '41_-72', '41_-71']);
-    assert.equal(withNeighbours([{ lat: -90, lon: 0 }], 'copernicus').length, 4);
 });
 
 test('region presets are valid cell ranges with unique ids', () => {
@@ -72,10 +96,43 @@ test('region presets are valid cell ranges with unique ids', () => {
     assert.equal(regionById('nope'), null);
 });
 
-test('whole-globe plan covers every source file', () => {
+test('planDownload counts terrain files, leaves out the ones in the folder, and skips sea unless asked', () => {
+    const cells = [{ lat: 47, lon: 8 }, { lat: 47, lon: 9 }, { lat: 40, lon: 44 }, { lat: 0, lon: -140 }];
+    const present = new Set(['N47E008.TER']);
+    const p = planDownload({
+        cells, present, bytesPerSecond: 1e6,
+        imagery: { south: 42, west: -72, north: 43, east: -71, zMax: 0, layers: ['esri_satellite', 'esri_labels'] },
+    });
+    assert.equal(p.cells, 4);
+    assert.equal(p.terrain.files, 3);
+    assert.equal(p.terrain.present, 1);
+    assert.equal(p.terrain.sea, 1);
+    assert.deepEqual(keys(p.terrain.missing), ['47_9', '40_44']);
+    assert.equal(p.terrain.downloadBytes, cellBuildEstimate(47, 9).downloadBytes + cellBuildEstimate(40, 44).downloadBytes);
+    assert.equal(p.terrain.terBytes, cellBuildEstimate(47, 9).terBytes + cellBuildEstimate(40, 44).terBytes);
+    assert.equal(p.terrain.totalTerBytes, p.terrain.terBytes + cellBuildEstimate(47, 8).terBytes);
+    assert.equal(p.imagery.tiles, 1);
+    assert.equal(p.imagery.files, 2);
+    assert.equal(p.seconds, (p.terrain.downloadBytes + p.imagery.bytes) / 1e6 + 2 * 6);
+
+    const box = planDownload({ cells, present, includeSea: true, imagery: null });
+    assert.equal(box.terrain.files, 4);
+    assert.equal(box.terrain.sea, 0);
+    assert.deepEqual(keys(box.terrain.missing), ['47_9', '40_44', '0_-140']);
+    assert.equal(box.terrain.downloadBytes, p.terrain.downloadBytes);      // the sea file downloads nothing
+    assert.equal(box.terrain.terBytes, p.terrain.terBytes + cellBuildEstimate(0, -140).terBytes);
+    assert.equal(box.imagery, null);
+});
+
+test('whole-globe plan builds a file for every land cell', () => {
     const p = planDownload({ cells: cellsForRange(regionById('globe')), present: null, imagery: null });
-    assert.equal(p.elevation.copernicus.files, CELL_INDEX_INFO.copernicus.files);
-    assert.equal(p.elevation.srtm.files, CELL_INDEX_INFO.srtm.files);
+    assert.equal(p.terrain.files, CELL_INDEX_INFO.copernicus.files + 25);
+    assert.equal(p.terrain.files + p.terrain.sea, 180 * 360);
+    assert.equal(p.terrain.missing.length, p.terrain.files);
+});
+
+test('imagery folder paths', () => {
+    assert.equal(imageryLocalPath('ESRI', 'Satellite', 12, 1239, 1514, 'jpg'), 'imagery/ESRI/Satellite/12/1239/1514.jpg');
 });
 
 test('each preset stays a few GB of imagery at its default depth', () => {
@@ -107,40 +164,6 @@ test('tileRanges counts tiles per zoom and splits at the 180° meridian', () => 
     assert.equal(crossing.length, 2);
     assert.deepEqual(crossing.map(r => [r.x0, r.x1]), [[7, 7], [0, 0]]);
     assert.equal([...tilesInRanges(world)].length, 21);
-});
-
-test('file names and folder paths', () => {
-    assert.deepEqual(elevationFile('srtm', 42, -72), {
-        name: 'N42W072',
-        url: 'https://s3.amazonaws.com/elevation-tiles-prod/skadi/N42/N42W072.hgt.gz',
-        path: 'elevation/srtm/N42W072.hgt.gz',
-    });
-    assert.equal(elevationFile('copernicus', -1, 5).path,
-        'elevation/copernicus/Copernicus_DSM_COG_10_S01_00_E005_00_DEM.tif');
-    assert.equal(elevationFileName('srtm', -34, 151), 'S34E151.hgt.gz');
-    assert.equal(imageryLocalPath('ESRI', 'Satellite', 12, 1239, 1514, 'jpg'), 'imagery/ESRI/Satellite/12/1239/1514.jpg');
-});
-
-test('planDownload separates present from missing files', () => {
-    const cells = [{ lat: 42, lon: -72 }];
-    const present = { srtm: new Set(['N42W072.hgt.gz', 'N43W071.hgt.gz']), copernicus: new Set() };
-    const p = planDownload({
-        cells, present, bytesPerSecond: 1e6,
-        imagery: { south: 42, west: -72, north: 43, east: -71, zMax: 0, layers: ['esri_satellite', 'esri_labels'] },
-    });
-    assert.equal(p.elevation.srtm.cells, 4);
-    assert.equal(p.elevation.copernicus.cells, 6);
-    assert.equal(p.elevation.srtm.files, 4);
-    assert.equal(p.elevation.srtm.present, 2);
-    assert.deepEqual(keys(p.elevation.srtm.missing), ['42_-71', '43_-72']);
-    assert.equal(p.elevation.srtm.missingBytes,
-        cellFileBytes('srtm', 42, -71) + cellFileBytes('srtm', 43, -72));
-    assert.equal(p.elevation.copernicus.present, 0);
-    assert.equal(p.imagery.tiles, 1);
-    assert.equal(p.imagery.files, 2);
-    assert.ok(p.terBytes.srtm > 30e6 && p.terBytes.srtm < 33e6);
-    const expectSeconds = (p.elevation.srtm.missingBytes + p.imagery.bytes) / 1e6;
-    assert.equal(p.seconds.srtm, expectSeconds);
 });
 
 test('formatting', () => {

@@ -87,12 +87,16 @@ import { Geozone, GeozoneVertex, GeozoneType, GeozoneShapes, GeozoneFenceAction 
 import store from './../js/store';
 import dialog from '../js/dialog';
 import {
-    ElevationSource, OnlineSource, TileDownload, canSaveTiles, declineTiles, downloadTiles, elevationSourceStatus,
-    forgetTileQuestions, getElevations, getOnlineSource, getTerFolder, getTileDownload, isLocalTerrainActive, setOnlineSource,
-    setTerFolder, setTileDownload, setTileWantedListener, summariseSources
+    ElevationSource, TileDownload, buildTiles, canBuildTiles, declineTiles, elevationSourceStatus,
+    forgetTerFiles, getElevations, getTileDownload, setTileDownload, setTileWantedListener, summariseSources
 } from './../js/elevationProvider.js';
-import { COPERNICUS_NOTICE_1, srtmTileName } from './../js/terrain_elevation.js';
+import { COPERNICUS_NOTICE_1 } from './../js/terrain_elevation.js';
 import { formatBytes } from './../js/offline_regions.js';
+import {
+    listTerrain, onTerrainChange, setTerrainFolder, terrainFileInfo, terrainFolderDir, terrainFolderIsDefault,
+    terrainFolderParentDir, terrainLibraryAvailable
+} from './../js/terrain_library.js';
+import { terrainCellOfFilename } from './../js/terrain_ter.js';
 import {
     AltitudeReason, MIN_AGL_DEFAULT_M, MIN_AGL_HIGHEST_M, MIN_AGL_LOWEST_M, TerrainDefaults, TerrainMode,
     analyseClearance, clearTerrainBits, legMinM, legMinOverrideM, sampleLegs, supportsTerrainOptions,
@@ -2600,53 +2604,52 @@ function iconKey(filename) {
 
     /////////////////////////////////////////////
     //
-    // Terrain folder: local .TER tiles as the elevation source
+    // Terrain folder: the .TER files ground heights are read from. One folder,
+    // shared with the Map Generator (js/terrain_library.js).
     //
     /////////////////////////////////////////////
-    const TERRAIN_FOLDER_KEY = 'missionPlannerTerrainFolder';
 
-    /* The folder is kept apart from the other planner settings: it takes effect when
-       it is chosen, not when the settings box is saved. Until one has been chosen
-       here, the folder the Map Generator last wrote terrain files to is used. */
+    /* The folder is not one of the planner's settings: it takes effect when it is
+       chosen, not when the settings box is saved. */
     function loadTerrainFolder() {
-        if (typeof globalThis.electronAPI?.readFileRanges !== 'function') {
-            setTerFolder(null);
-            return;     // this build cannot read local files; the row stays hidden
+        if (!terrainLibraryAvailable()) {
+            return;     // the web version keeps no files; the row stays hidden
         }
-        let folder = store.get(TERRAIN_FOLDER_KEY, null);
-        if (folder === null) {
-            folder = store.get('mapgen_sd_path', null) || '';
-        }
-        setTerFolder(folder || null);
         $('#MPterrainFolderRow').show();
-        refreshTerrainFolderDisplay();
+        forgetTerFiles();       // files may have been copied into the folder since the last visit
+        if (stopTerrainListening) stopTerrainListening();
+        stopTerrainListening = onTerrainChange(onTerrainFolderChange);
+        // The first read of the folder's index: labels drawn before it finished say
+        // "terrain file" without the source, so they are drawn again.
+        refreshTerrainFolderDisplay().then(() => {
+            if (selectedMarker) showElevationSource(selectedMarker);
+        });
     }
 
-    async function refreshTerrainFolderDisplay() {
-        const folder = getTerFolder();
-        const $path = $('#MPterrainFolderPath');
-        const $status = $('#MPterrainFolderStatus');
-        $('#MPterrainFolderClear').toggle(!!folder);
+    let terrainFolderDisplayRun = 0;
 
-        if (!folder) {
-            $path.text(i18n.getMessage('missionTerrainFolderNone'));
-            $status.text('');
-            return;
-        }
-        $path.text(folder);
-        let reachable = false;
+    async function refreshTerrainFolderDisplay() {
+        if (!terrainLibraryAvailable()) return;
+        const run = ++terrainFolderDisplayRun;
+        const folder = terrainFolderDir();
+        // The path is not passed through getMessage: it escapes its arguments for HTML,
+        // and .text() would then show "&#x2F;" for every slash.
+        $('#MPterrainFolderPath').text(terrainFolderIsDefault() ? folder + ' ' + i18n.getMessage('missionTerrainFolderIsDefault') : folder);
+        $('#MPterrainFolderDefault').toggle(!terrainFolderIsDefault());
+        let listing = null;
         try {
-            reachable = await globalThis.electronAPI.pathExists(folder);
+            listing = await listTerrain();      // also reads the index the source labels use
         } catch (error) {
-            reachable = false;
+            listing = null;
         }
-        if (getTerFolder() !== folder) return;   // changed while checking
-        if (!reachable) {
-            $status.text(i18n.getMessage('missionTerrainFolderNotFound'));
-            return;
-        }
+        if (run !== terrainFolderDisplayRun) return;    // asked again while reading
+        $('#MPterrainFolderCount').text(listing
+            ? i18n.getMessage(listing.count === 1 ? 'missionTerrainFolderCountOne' : 'missionTerrainFolderCount',
+                [String(listing.count), formatBytes(listing.bytes)])
+            : '');
         const missing = elevationSourceStatus().tilesMissing;
-        $status.text(missing.length ? i18n.getMessage('missionTerrainFolderMissingTiles', [missing.join(', ')]) : '');
+        $('#MPterrainFolderStatus').text(missing.length ? i18n.getMessage('missionTerrainFolderMissingTiles', [missing.join(', ')]) : '');
+        $('#MPterrainFolderBuildMissing').toggle(missing.length > 0 && !terrainBuild.busy);
     }
 
     /* Everything on screen that was computed from the old source is looked up again. */
@@ -2660,78 +2663,64 @@ function iconKey(filename) {
         });
     }
 
+    /* Another folder was chosen, or a terrain file was written into this one: heights
+       that came from the old folder or from the online source are looked up again. */
+    function onTerrainFolderChange() {
+        refreshTerrainFolderDisplay().then(() => {
+            refreshElevationsOnScreen();
+            scheduleTerrainAnalysis();
+        });
+    }
+
+    /* null goes back to the default folder. The change comes back through onTerrainFolderChange. */
     function applyTerrainFolder(folder) {
-        store.set(TERRAIN_FOLDER_KEY, folder || '');
-        setTerFolder(folder || null);
+        setTerrainFolder(folder || null);
         refreshTerrainFolderDisplay();
-        refreshElevationsOnScreen();
     }
 
     /////////////////////////////////////////////
     //
-    // Elevation source: where heights come from outside the terrain folder, and
-    // whether the tiles they are read from are kept in the offline data folder
+    // Building terrain files: a cell with no file in the folder is looked up
+    // online, and its file can be built (asked, always, or never)
     //
     /////////////////////////////////////////////
-    const ELEVATION_SOURCE_KEY = 'missionPlannerElevationSource';
     const TILE_DOWNLOAD_KEY = 'missionPlannerTileDownload';
     const WEB_ELEVATION_NOTICE_KEY = 'missionPlannerWebElevationNoticeHidden';
 
     const ELEVATION_SOURCE_LABEL = {
         [ElevationSource.TER]: 'missionElevationSourceTer',
         [ElevationSource.COPERNICUS]: 'missionElevationSourceCopernicus',
-        [ElevationSource.COPERNICUS_SAVED]: 'missionElevationSourceCopernicusSaved',
-        [ElevationSource.SRTM_SAVED]: 'missionElevationSourceSrtmSaved',
-        [ElevationSource.SRTM_ONLINE]: 'missionElevationSourceSrtmOnline',
-        [ElevationSource.ASTER]: 'missionElevationSourceAster',
-        [ElevationSource.ASTER_FALLBACK]: 'missionElevationSourceAsterFallback'
+        [ElevationSource.ASTER]: 'missionElevationSourceAster'
     };
 
-    /* Name of an elevation source as shown next to a height; empty when there is none. */
-    function elevationSourceLabel(source) {
+    /* What a terrain file was built from, as the folder's index records it. */
+    const TERRAIN_FILE_LABEL = {
+        copernicus: 'missionElevationSourceTerCopernicus',
+        srtm: 'missionElevationSourceTerSrtm',
+        sea: 'missionElevationSourceTerSea'
+    };
+
+    /* Name of an elevation source as shown next to a height; empty when there is none.
+       For a terrain file the label says what the file was built from, when the
+       folder's index knows. */
+    function elevationSourceLabel(source, file) {
+        if (source === ElevationSource.TER && file) {
+            const info = terrainFileInfo(file);
+            if (info && TERRAIN_FILE_LABEL[info.source]) {
+                return i18n.getMessage(TERRAIN_FILE_LABEL[info.source]);
+            }
+        }
         return ELEVATION_SOURCE_LABEL[source] ? i18n.getMessage(ELEVATION_SOURCE_LABEL[source]) : '';
     }
 
-    /* Like the terrain folder, both settings take effect when they are changed, not
-       when the settings box is saved. */
+    /* Like the terrain folder, the setting takes effect when it is changed, not when
+       the settings box is saved. */
     function loadElevationSource() {
-        setOnlineSource(store.get(ELEVATION_SOURCE_KEY, OnlineSource.COPERNICUS));
         setTileDownload(store.get(TILE_DOWNLOAD_KEY, TileDownload.ASK));
-        $('#MPelevationSource').val(getOnlineSource());
         $('#MPtileDownload').val(getTileDownload());
-        $('#MPtileDownloadRow').toggle(canSaveTiles());
-        refreshElevationSourceNote();
-        setTileWantedListener(canSaveTiles() ? queueTileDialog : null);
-    }
-
-    function refreshElevationSourceNote() {
-        const source = getOnlineSource();
-        let note;
-        if (source === OnlineSource.COPERNICUS) {
-            note = i18n.getMessage('missionElevationSourceNoteCopernicus', [COPERNICUS_NOTICE_1]);
-        } else if (source === OnlineSource.SRTM) {
-            note = i18n.getMessage('missionElevationSourceNoteSrtm');
-        } else {
-            note = i18n.getMessage('missionElevationSourceNoteAster');
-        }
-        $('#MPelevationSourceNote').text(note);
-    }
-
-    function applyElevationSource(source) {
-        // A question about the old source's tiles is withdrawn, not answered.
-        if (!tileDialog.busy && tileDialog.tiles.length) {
-            clearTimeout(tileDialog.timer);
-            forgetTileQuestions(tileDialog.tiles);
-            tileDialog.tiles = [];
-            // Only when it is showing: closing a jBox that never opened keeps the next
-            // question from appearing.
-            if (tileDialog.modal && tileDialog.modal.isOpen) tileDialog.modal.close();
-        }
-        setOnlineSource(source);
-        store.set(ELEVATION_SOURCE_KEY, getOnlineSource());
-        $('#MPelevationSource').val(getOnlineSource());
-        refreshElevationSourceNote();
-        refreshElevationsOnScreen();
+        $('#MPtileDownloadRow').toggle(canBuildTiles());
+        $('#MPelevationSourceNote').text(i18n.getMessage('missionElevationSourceNoteCopernicus', [COPERNICUS_NOTICE_1]));
+        setTileWantedListener(canBuildTiles() ? queueTileDialog : null);
     }
 
     function applyTileDownload(mode) {
@@ -2740,8 +2729,61 @@ function iconKey(filename) {
         $('#MPtileDownload').val(getTileDownload());
     }
 
-    /* The tile dialog: lookups report tiles that are not in the offline folder; they
-       are gathered for a moment so that a mission spanning several tiles asks once. */
+    const TERRAIN_STAGE_LABEL = {
+        queued: 'missionTerrainBuildStageQueued',
+        downloading: 'missionTerrainBuildStageDownloading',
+        decoding: 'missionTerrainBuildStageConverting',
+        grid: 'missionTerrainBuildStageConverting',
+        edges: 'missionTerrainBuildStageEdges',
+        packing: 'missionTerrainBuildStageConverting',
+        writing: 'missionTerrainBuildStageSaving'
+    };
+
+    const terrainBuild = {busy: false};
+
+    /* Builds terrain files into the folder and reports in the log, in the tile dialog
+       (when it is open) and under the folder in the settings box. The heights on
+       screen are refreshed by onTerrainFolderChange as each file is written. */
+    async function runTerrainBuild(tiles) {
+        terrainBuild.busy = true;
+        $('#MPterrainFolderBuildMissing').hide();
+        let outcome = {built: [], failed: [], aborted: false};
+        try {
+            outcome = await buildTiles(tiles, (step) => {
+                if (!step.tile) return;
+                const stage = i18n.getMessage(TERRAIN_STAGE_LABEL[step.stage] || 'missionTerrainBuildStageConverting');
+                const text = i18n.getMessage('missionTileDialogProgress', [step.tile.name, String(step.done + 1), String(step.total), stage]);
+                $('#terrainTileDialogProgress').text(text);
+                $('#MPterrainBuildStatus').text(text);
+            });
+        } catch (error) {
+            outcome.failed = tiles.map(tile => ({tile, error: String(error?.message || error)}));
+        } finally {
+            terrainBuild.busy = false;
+        }
+        $('#MPterrainBuildStatus').text('');
+        if (outcome.built.length) {
+            GUI.log(i18n.getMessage('missionTileDialogDone', [outcome.built.map(tile => tile.name).join(', ')]));
+        }
+        for (const failure of outcome.failed) {
+            GUI.log(i18n.getMessage('missionTileDialogFailed', [failure.tile ? failure.tile.name : '?', failure.error]));
+        }
+        refreshTerrainFolderDisplay();
+        return outcome;
+    }
+
+    /* "Build them" next to the list of cells the folder has no file for. */
+    function buildMissingTerrain() {
+        if (terrainBuild.busy) return;
+        const tiles = elevationSourceStatus().tilesMissing
+            .map(name => ({name, cell: terrainCellOfFilename(name)}))
+            .filter(entry => entry.cell)
+            .map(entry => ({key: entry.name, name: entry.name, lat: entry.cell.lat, lon: entry.cell.lon}));
+        if (tiles.length) runTerrainBuild(tiles);
+    }
+
+    /* The tile dialog: lookups report terrain files that are not in the folder; they
+       are gathered for a moment so that a mission spanning several cells asks once. */
     const tileDialog = {modal: null, tiles: [], timer: null, busy: false};
 
     function queueTileDialog(tiles) {
@@ -2754,21 +2796,20 @@ function iconKey(filename) {
         tileDialog.timer = setTimeout(showTileDialog, 600);
     }
 
-    function tileDisplayName(tile) {
-        return srtmTileName(tile.lat, tile.lon);
-    }
-
     function showTileDialog() {
         if (!tileDialog.modal || tileDialog.busy || tileDialog.tiles.length === 0) return;
         const tiles = tileDialog.tiles;
-        const sourceName = i18n.getMessage(tiles[0].source === OnlineSource.SRTM ? 'missionElevationSourceOptSrtm' : 'missionElevationSourceOptCopernicus');
-        const total = formatBytes(tiles.reduce((sum, tile) => sum + tile.bytes, 0));
+        const downloadBytes = tiles.reduce((sum, tile) => sum + tile.downloadBytes, 0);
+        const download = formatBytes(downloadBytes);
+        const disk = formatBytes(tiles.reduce((sum, tile) => sum + tile.terBytes, 0));
         if (tiles.length === 1) {
-            $('#terrainTileDialogText').text(i18n.getMessage('missionTileDialogOne', [sourceName, tileDisplayName(tiles[0]), total]));
+            $('#terrainTileDialogText').text(downloadBytes > 0
+                ? i18n.getMessage('missionTileDialogOne', [tiles[0].name, download, disk])
+                : i18n.getMessage('missionTileDialogOneSea', [tiles[0].name, disk]));
             $('#terrainTileDialogList').text('');
         } else {
-            $('#terrainTileDialogText').text(i18n.getMessage('missionTileDialogMany', [String(tiles.length), sourceName, total]));
-            const shown = tiles.slice(0, 8).map(tile => tileDisplayName(tile) + ' (' + formatBytes(tile.bytes) + ')').join(', ');
+            $('#terrainTileDialogText').text(i18n.getMessage('missionTileDialogMany', [String(tiles.length), download, disk]));
+            const shown = tiles.slice(0, 8).map(tile => tile.name).join(', ');
             $('#terrainTileDialogList').text(tiles.length > 8 ? i18n.getMessage('missionTileDialogMore', [shown, String(tiles.length - 8)]) : shown);
         }
         $('#terrainTileDialogProgress').text('');
@@ -2777,7 +2818,7 @@ function iconKey(filename) {
         tileDialog.modal.open();
     }
 
-    async function downloadQueuedTiles() {
+    async function buildQueuedTiles() {
         if (tileDialog.busy || tileDialog.tiles.length === 0) return;
         const tiles = tileDialog.tiles;
         tileDialog.tiles = [];
@@ -2786,32 +2827,22 @@ function iconKey(filename) {
             applyTileDownload(TileDownload.ALWAYS);
         }
         $('#terrainTileDialogDownload, #terrainTileDialogSkip').addClass('disabled');
-        let outcome = {downloaded: [], failed: []};
+        let outcome = {built: [], failed: [], aborted: false};
         try {
-            outcome = await downloadTiles(tiles, ({done, total, tile}) => {
-                if (tile) {
-                    $('#terrainTileDialogProgress').text(i18n.getMessage('missionTileDialogProgress',
-                        [String(done + 1), String(total), tileDisplayName(tile) + ' (' + formatBytes(tile.bytes) + ')']));
-                }
-            });
+            // Closing the box does not stop the build: it carries on and reports in the log.
+            outcome = await runTerrainBuild(tiles);
         } finally {
             tileDialog.busy = false;
         }
-        if (outcome.downloaded.length) {
-            GUI.log(i18n.getMessage('missionTileDialogDone', [outcome.downloaded.map(tileDisplayName).join(', ')]));
-        }
-        for (const failure of outcome.failed) {
-            GUI.log(i18n.getMessage('missionTileDialogFailed', [tileDisplayName(failure.tile), failure.error]));
-        }
         if (outcome.failed.length) {
             $('#terrainTileDialogProgress').text(outcome.failed
-                .map(failure => i18n.getMessage('missionTileDialogFailed', [tileDisplayName(failure.tile), failure.error])).join(' '));
+                .map(failure => i18n.getMessage('missionTileDialogFailed', [failure.tile ? failure.tile.name : '?', failure.error])).join(' '));
             $('#terrainTileDialogSkip').removeClass('disabled');
         } else if (tileDialog.modal) {
             tileDialog.modal.close();
         }
         if (tileDialog.tiles.length) {
-            showTileDialog();      // tiles that were asked for while the download ran
+            showTileDialog();      // files that were asked for while the build ran
         }
     }
 
@@ -2826,9 +2857,6 @@ function iconKey(filename) {
     }
 
     function initElevationSourceUi() {
-        $('#MPelevationSource').on('change', function () {
-            applyElevationSource($(this).val());
-        });
         $('#MPtileDownload').on('change', function () {
             applyTileDownload($(this).val());
         });
@@ -2839,7 +2867,7 @@ function iconKey(filename) {
             animation: false,
             title: i18n.getMessage('missionTileDialogTitle'),
             content: $('#terrainTileDialogContent'),
-            // Closing the box without an answer leaves the tiles alone, like "points only".
+            // Closing the box without an answer leaves the files alone, like "Not now".
             onClose: function () {
                 if (!tileDialog.busy && tileDialog.tiles.length) {
                     declineTiles(tileDialog.tiles);
@@ -2848,14 +2876,14 @@ function iconKey(filename) {
             }
         });
         $('#terrainTileDialogDownload').on('click', function () {
-            if (!$(this).hasClass('disabled')) downloadQueuedTiles();
+            if (!$(this).hasClass('disabled')) buildQueuedTiles();
         });
         $('#terrainTileDialogSkip').on('click', function () {
             if (!$(this).hasClass('disabled')) skipQueuedTiles();
         });
 
-        // The web version has no offline folder and no terrain folder, and a browser may
-        // refuse the elevation servers: say so once, so nobody hunts for a missing feature.
+        // The web version has no terrain folder, and a browser may refuse the
+        // elevation servers: say so once, so nobody hunts for a missing feature.
         if (globalThis.__INAV_BROWSER_BUILD__ && !store.get(WEB_ELEVATION_NOTICE_KEY, false)) {
             const notice = new jBox('Modal', {
                 width: 480,
@@ -2879,9 +2907,10 @@ function iconKey(filename) {
     /* Says where the elevation shown for a waypoint came from. */
     function showElevationSource(wp) {
         const source = wp && typeof wp.getElevationSource === 'function' ? wp.getElevationSource() : 'none';
+        const file = wp && typeof wp.getElevationFile === 'function' ? wp.getElevationFile() : null;
         const $label = $('#elevationSourceAtWP');
         $label.toggleClass('fromTerrainFile', source === ElevationSource.TER);
-        $label.text(elevationSourceLabel(source));
+        $label.text(elevationSourceLabel(source, file));
         if ($('#missionPlannerSettings').is(':visible')) {
             refreshTerrainFolderDisplay();
         }
@@ -5138,7 +5167,7 @@ function iconKey(filename) {
                 HOME.setAlt(elevation);
                 homeElevationPosition = position;
                 $('#elevationValueAtHome').text(elevation + ' m');
-                $('#elevationSourceAtHome').text(elevationSourceLabel(HOME.getElevationSource()));
+                $('#elevationSourceAtHome').text(elevationSourceLabel(HOME.getElevationSource(), HOME.getElevationFile()));
                 return elevation * 100;
             } catch (error) {
                 console.warn('home elevation lookup failed:', error.message);
@@ -8435,22 +8464,36 @@ function iconKey(filename) {
 
         $('#MPterrainFolderChoose').on('click', async function (event) {
             event.preventDefault();
-            const options = {
+            // The dialog starts where the folder is. From the default folder it
+            // starts one level up, where "New folder" makes a folder for another area.
+            const startIn = terrainFolderIsDefault() ? terrainFolderParentDir() : terrainFolderDir();
+            await globalThis.electronAPI.ensureFolder(startIn);
+            const result = await globalThis.electronAPI.showOpenDialog({
                 title: i18n.getMessage('missionTerrainFolderDialogTitle'),
-                properties: ['openDirectory']
-            };
-            if (getTerFolder()) {
-                options.defaultPath = getTerFolder();
-            }
-            const result = await globalThis.electronAPI.showOpenDialog(options);
+                properties: ['openDirectory', 'createDirectory'],
+                defaultPath: startIn
+            });
             if (!result.canceled && result.filePaths && result.filePaths.length > 0) {
                 applyTerrainFolder(result.filePaths[0]);
             }
         });
 
-        $('#MPterrainFolderClear').on('click', function (event) {
+        $('#MPterrainFolderOpen').on('click', async function (event) {
+            event.preventDefault();
+            const error = await globalThis.electronAPI.openFolder(terrainFolderDir());
+            if (error) {
+                GUI.log(i18n.getMessage('missionTerrainFolderNotFound', [String(error)]));
+            }
+        });
+
+        $('#MPterrainFolderDefault').on('click', function (event) {
             event.preventDefault();
             applyTerrainFolder(null);
+        });
+
+        $('#MPterrainFolderBuildMissing').on('click', function (event) {
+            event.preventDefault();
+            buildMissingTerrain();
         });
 
         // Editing a value clears the tick of the previous save
@@ -9418,6 +9461,9 @@ missionControlTab.setBit = function(bits, bit, value) {
     // }
 // }
 
+/* Removes this visit's listener on the terrain folder (js/terrain_library.js). */
+let stopTerrainListening = null;
+
 missionControlTab.cleanup = function (callback) {
     // The elevation panel's drag listens on the document, so it outlives the tab unless
     // it is taken off here - reopening the tab would otherwise stack one pair per visit.
@@ -9425,6 +9471,10 @@ missionControlTab.cleanup = function (callback) {
     // The tile dialog belongs to this visit of the tab; lookups made from other tabs
     // (or after it closed) must not call into its removed markup.
     setTileWantedListener(null);
+    if (stopTerrainListening) {
+        stopTerrainListening();
+        stopTerrainListening = null;
+    }
     /* jBox appends its wrapper to body, which the tab switch does not empty, so the
        modal's markup and its ids would stack one copy per visit. */
     $('.jBox-wrapper').remove();
