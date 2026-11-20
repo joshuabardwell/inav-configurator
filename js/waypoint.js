@@ -163,7 +163,8 @@ let Waypoint = function (number, action, lat, lon, alt=0, p1=0, p2=0, p3=0, endM
         return elevation;
     }
 
-    // Where the last getElevation() answer came from: "ter", "online" or "none".
+    // Where the last getElevation() answer came from: an ElevationSource value of
+    // js/elevationProvider.js ("ter", "copernicus", "aster-fallback", ... or "none").
     self.getElevationSource = function () {
         return elevationSource;
     }

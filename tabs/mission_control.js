@@ -87,9 +87,12 @@ import { Geozone, GeozoneVertex, GeozoneType, GeozoneShapes, GeozoneFenceAction 
 import store from './../js/store';
 import dialog from '../js/dialog';
 import {
-    ElevationSource, elevationSourceStatus, getElevations, getTerFolder, isLocalTerrainActive, setTerFolder,
-    summariseSources
+    ElevationSource, OnlineSource, TileDownload, canSaveTiles, declineTiles, downloadTiles, elevationSourceStatus,
+    forgetTileQuestions, getElevations, getOnlineSource, getTerFolder, getTileDownload, isLocalTerrainActive, setOnlineSource,
+    setTerFolder, setTileDownload, setTileWantedListener, summariseSources
 } from './../js/elevationProvider.js';
+import { COPERNICUS_NOTICE_1, srtmTileName } from './../js/terrain_elevation.js';
+import { formatBytes } from './../js/offline_regions.js';
 import {
     AltitudeReason, MIN_AGL_DEFAULT_M, MIN_AGL_HIGHEST_M, MIN_AGL_LOWEST_M, TerrainDefaults, TerrainMode,
     analyseClearance, clearTerrainBits, legMinM, legMinOverrideM, sampleLegs, supportsTerrainOptions,
@@ -1563,6 +1566,7 @@ function iconKey(filename) {
        
             loadSettings();
             loadTerrainFolder();
+            loadElevationSource();
             // let the dom load finish, avoiding the resizing of the map
             setTimeout(initMap, 200);
             // Set initial button visibility based on mission state
@@ -1600,6 +1604,7 @@ function iconKey(filename) {
         $('#landSpeedNotUpdatedOk').on('click', function () {
             landSpeedNotUpdatedModal.close();
         });
+        initElevationSourceUi();
 
         // Append shortcut hints after i18n sets titles (Ctrl-based)
         const addShortcutHint = (selector, suffix) => {
@@ -2645,11 +2650,7 @@ function iconKey(filename) {
     }
 
     /* Everything on screen that was computed from the old source is looked up again. */
-    function applyTerrainFolder(folder) {
-        store.set(TERRAIN_FOLDER_KEY, folder || '');
-        setTerFolder(folder || null);
-        refreshTerrainFolderDisplay();
-
+    function refreshElevationsOnScreen() {
         invalidateHomeElevation();
         resolveHomeElevationCm().then(() => {
             if (selectedMarker) {
@@ -2659,21 +2660,236 @@ function iconKey(filename) {
         });
     }
 
+    function applyTerrainFolder(folder) {
+        store.set(TERRAIN_FOLDER_KEY, folder || '');
+        setTerFolder(folder || null);
+        refreshTerrainFolderDisplay();
+        refreshElevationsOnScreen();
+    }
+
+    /////////////////////////////////////////////
+    //
+    // Elevation source: where heights come from outside the terrain folder, and
+    // whether the tiles they are read from are kept in the offline data folder
+    //
+    /////////////////////////////////////////////
+    const ELEVATION_SOURCE_KEY = 'missionPlannerElevationSource';
+    const TILE_DOWNLOAD_KEY = 'missionPlannerTileDownload';
+    const WEB_ELEVATION_NOTICE_KEY = 'missionPlannerWebElevationNoticeHidden';
+
+    const ELEVATION_SOURCE_LABEL = {
+        [ElevationSource.TER]: 'missionElevationSourceTer',
+        [ElevationSource.COPERNICUS]: 'missionElevationSourceCopernicus',
+        [ElevationSource.COPERNICUS_SAVED]: 'missionElevationSourceCopernicusSaved',
+        [ElevationSource.SRTM_SAVED]: 'missionElevationSourceSrtmSaved',
+        [ElevationSource.SRTM_ONLINE]: 'missionElevationSourceSrtmOnline',
+        [ElevationSource.ASTER]: 'missionElevationSourceAster',
+        [ElevationSource.ASTER_FALLBACK]: 'missionElevationSourceAsterFallback'
+    };
+
+    /* Name of an elevation source as shown next to a height; empty when there is none. */
+    function elevationSourceLabel(source) {
+        return ELEVATION_SOURCE_LABEL[source] ? i18n.getMessage(ELEVATION_SOURCE_LABEL[source]) : '';
+    }
+
+    /* Like the terrain folder, both settings take effect when they are changed, not
+       when the settings box is saved. */
+    function loadElevationSource() {
+        setOnlineSource(store.get(ELEVATION_SOURCE_KEY, OnlineSource.COPERNICUS));
+        setTileDownload(store.get(TILE_DOWNLOAD_KEY, TileDownload.ASK));
+        $('#MPelevationSource').val(getOnlineSource());
+        $('#MPtileDownload').val(getTileDownload());
+        $('#MPtileDownloadRow').toggle(canSaveTiles());
+        refreshElevationSourceNote();
+        setTileWantedListener(canSaveTiles() ? queueTileDialog : null);
+    }
+
+    function refreshElevationSourceNote() {
+        const source = getOnlineSource();
+        let note;
+        if (source === OnlineSource.COPERNICUS) {
+            note = i18n.getMessage('missionElevationSourceNoteCopernicus', [COPERNICUS_NOTICE_1]);
+        } else if (source === OnlineSource.SRTM) {
+            note = i18n.getMessage('missionElevationSourceNoteSrtm');
+        } else {
+            note = i18n.getMessage('missionElevationSourceNoteAster');
+        }
+        $('#MPelevationSourceNote').text(note);
+    }
+
+    function applyElevationSource(source) {
+        // A question about the old source's tiles is withdrawn, not answered.
+        if (!tileDialog.busy && tileDialog.tiles.length) {
+            clearTimeout(tileDialog.timer);
+            forgetTileQuestions(tileDialog.tiles);
+            tileDialog.tiles = [];
+            // Only when it is showing: closing a jBox that never opened keeps the next
+            // question from appearing.
+            if (tileDialog.modal && tileDialog.modal.isOpen) tileDialog.modal.close();
+        }
+        setOnlineSource(source);
+        store.set(ELEVATION_SOURCE_KEY, getOnlineSource());
+        $('#MPelevationSource').val(getOnlineSource());
+        refreshElevationSourceNote();
+        refreshElevationsOnScreen();
+    }
+
+    function applyTileDownload(mode) {
+        setTileDownload(mode);
+        store.set(TILE_DOWNLOAD_KEY, getTileDownload());
+        $('#MPtileDownload').val(getTileDownload());
+    }
+
+    /* The tile dialog: lookups report tiles that are not in the offline folder; they
+       are gathered for a moment so that a mission spanning several tiles asks once. */
+    const tileDialog = {modal: null, tiles: [], timer: null, busy: false};
+
+    function queueTileDialog(tiles) {
+        for (const tile of tiles) {
+            if (!tileDialog.tiles.some(queued => queued.key === tile.key)) {
+                tileDialog.tiles.push(tile);
+            }
+        }
+        clearTimeout(tileDialog.timer);
+        tileDialog.timer = setTimeout(showTileDialog, 600);
+    }
+
+    function tileDisplayName(tile) {
+        return srtmTileName(tile.lat, tile.lon);
+    }
+
+    function showTileDialog() {
+        if (!tileDialog.modal || tileDialog.busy || tileDialog.tiles.length === 0) return;
+        const tiles = tileDialog.tiles;
+        const sourceName = i18n.getMessage(tiles[0].source === OnlineSource.SRTM ? 'missionElevationSourceOptSrtm' : 'missionElevationSourceOptCopernicus');
+        const total = formatBytes(tiles.reduce((sum, tile) => sum + tile.bytes, 0));
+        if (tiles.length === 1) {
+            $('#terrainTileDialogText').text(i18n.getMessage('missionTileDialogOne', [sourceName, tileDisplayName(tiles[0]), total]));
+            $('#terrainTileDialogList').text('');
+        } else {
+            $('#terrainTileDialogText').text(i18n.getMessage('missionTileDialogMany', [String(tiles.length), sourceName, total]));
+            const shown = tiles.slice(0, 8).map(tile => tileDisplayName(tile) + ' (' + formatBytes(tile.bytes) + ')').join(', ');
+            $('#terrainTileDialogList').text(tiles.length > 8 ? i18n.getMessage('missionTileDialogMore', [shown, String(tiles.length - 8)]) : shown);
+        }
+        $('#terrainTileDialogProgress').text('');
+        $('#terrainTileDialogRemember').prop('checked', false);
+        $('#terrainTileDialogDownload, #terrainTileDialogSkip').removeClass('disabled');
+        tileDialog.modal.open();
+    }
+
+    async function downloadQueuedTiles() {
+        if (tileDialog.busy || tileDialog.tiles.length === 0) return;
+        const tiles = tileDialog.tiles;
+        tileDialog.tiles = [];
+        tileDialog.busy = true;
+        if ($('#terrainTileDialogRemember').prop('checked')) {
+            applyTileDownload(TileDownload.ALWAYS);
+        }
+        $('#terrainTileDialogDownload, #terrainTileDialogSkip').addClass('disabled');
+        let outcome = {downloaded: [], failed: []};
+        try {
+            outcome = await downloadTiles(tiles, ({done, total, tile}) => {
+                if (tile) {
+                    $('#terrainTileDialogProgress').text(i18n.getMessage('missionTileDialogProgress',
+                        [String(done + 1), String(total), tileDisplayName(tile) + ' (' + formatBytes(tile.bytes) + ')']));
+                }
+            });
+        } finally {
+            tileDialog.busy = false;
+        }
+        if (outcome.downloaded.length) {
+            GUI.log(i18n.getMessage('missionTileDialogDone', [outcome.downloaded.map(tileDisplayName).join(', ')]));
+        }
+        for (const failure of outcome.failed) {
+            GUI.log(i18n.getMessage('missionTileDialogFailed', [tileDisplayName(failure.tile), failure.error]));
+        }
+        if (outcome.failed.length) {
+            $('#terrainTileDialogProgress').text(outcome.failed
+                .map(failure => i18n.getMessage('missionTileDialogFailed', [tileDisplayName(failure.tile), failure.error])).join(' '));
+            $('#terrainTileDialogSkip').removeClass('disabled');
+        } else if (tileDialog.modal) {
+            tileDialog.modal.close();
+        }
+        if (tileDialog.tiles.length) {
+            showTileDialog();      // tiles that were asked for while the download ran
+        }
+    }
+
+    function skipQueuedTiles() {
+        if (tileDialog.busy) return;
+        if ($('#terrainTileDialogRemember').prop('checked')) {
+            applyTileDownload(TileDownload.NEVER);
+        }
+        declineTiles(tileDialog.tiles);
+        tileDialog.tiles = [];
+        if (tileDialog.modal) tileDialog.modal.close();
+    }
+
+    function initElevationSourceUi() {
+        $('#MPelevationSource').on('change', function () {
+            applyElevationSource($(this).val());
+        });
+        $('#MPtileDownload').on('change', function () {
+            applyTileDownload($(this).val());
+        });
+
+        tileDialog.modal = new jBox('Modal', {
+            width: 520,
+            closeButton: 'title',
+            animation: false,
+            title: i18n.getMessage('missionTileDialogTitle'),
+            content: $('#terrainTileDialogContent'),
+            // Closing the box without an answer leaves the tiles alone, like "points only".
+            onClose: function () {
+                if (!tileDialog.busy && tileDialog.tiles.length) {
+                    declineTiles(tileDialog.tiles);
+                    tileDialog.tiles = [];
+                }
+            }
+        });
+        $('#terrainTileDialogDownload').on('click', function () {
+            if (!$(this).hasClass('disabled')) downloadQueuedTiles();
+        });
+        $('#terrainTileDialogSkip').on('click', function () {
+            if (!$(this).hasClass('disabled')) skipQueuedTiles();
+        });
+
+        // The web version has no offline folder and no terrain folder, and a browser may
+        // refuse the elevation servers: say so once, so nobody hunts for a missing feature.
+        if (globalThis.__INAV_BROWSER_BUILD__ && !store.get(WEB_ELEVATION_NOTICE_KEY, false)) {
+            const notice = new jBox('Modal', {
+                width: 480,
+                closeButton: 'title',
+                animation: false,
+                title: i18n.getMessage('missionWebElevationNoticeTitle'),
+                content: $('#terrainWebNoticeContent'),
+                onClose: function () {
+                    if ($('#terrainWebNoticeHide').prop('checked')) {
+                        store.set(WEB_ELEVATION_NOTICE_KEY, true);
+                    }
+                }
+            });
+            $('#terrainWebNoticeOk').on('click', function () {
+                notice.close();
+            });
+            notice.open();
+        }
+    }
+
     /* Says where the elevation shown for a waypoint came from. */
     function showElevationSource(wp) {
         const source = wp && typeof wp.getElevationSource === 'function' ? wp.getElevationSource() : 'none';
         const $label = $('#elevationSourceAtWP');
         $label.toggleClass('fromTerrainFile', source === ElevationSource.TER);
-        if (source === ElevationSource.TER) {
-            $label.text(i18n.getMessage('missionElevationSourceTer'));
-        } else if (source === ElevationSource.ONLINE || source === ElevationSource.ONLINE_COARSE) {
-            $label.text(i18n.getMessage('missionElevationSourceOnline'));
-        } else {
-            $label.text('');
-        }
+        $label.text(elevationSourceLabel(source));
         if ($('#missionPlannerSettings').is(':visible')) {
             refreshTerrainFolderDisplay();
         }
+    }
+
+    /* Shown while a lookup for the selected waypoint is under way. */
+    function showElevationLoading() {
+        $('#elevationSourceAtWP').removeClass('fromTerrainFile').text(i18n.getMessage('missionElevationSourceLoading'));
     }
 
     /////////////////////////////////////////////
@@ -4652,6 +4868,7 @@ function iconKey(filename) {
             const wp = selectedMarker;
             const approachWp = selectedFwApproachWp;
             (async () => {
+                showElevationLoading();
                 const elevationAtWP = await wp.getElevation(globalSettings);
                 // the waypoint may have been deleted or deselected while the elevation was fetched
                 if (selectedMarker !== wp) return;
@@ -4756,13 +4973,21 @@ function iconKey(filename) {
         // that only needs the reading recomputed can hand it over and skip the lookup.
         let elevation = Number(knownElevation);
         if (Number.isNaN(elevation)) {
+            showElevationLoading();
             try {
                 elevation = Number(await wp.getElevation(globalSettings));
             } catch (error) {
                 console.warn('elevation lookup failed:', error.message);
+                elevation = NaN;
+            }
+            if (selectedMarker !== wp) return;
+            if (Number.isNaN(elevation)) {
+                // No source answered: say so instead of leaving "loading" next to the
+                // height of wherever the waypoint was before.
+                $('#elevationValueAtWP').text(i18n.getMessage('missionNA'));
+                showElevationSource(wp);
                 return;
             }
-            if (selectedMarker !== wp || Number.isNaN(elevation)) return;
         }
 
         $('#elevationValueAtWP').text(elevation);
@@ -4888,6 +5113,7 @@ function iconKey(filename) {
         homeElevationRequest = null;
         HOME.setAlt("N/A");
         $('#elevationValueAtHome').text('N/A');
+        $('#elevationSourceAtHome').text('');
     }
 
     async function resolveHomeElevationCm() {
@@ -4912,6 +5138,7 @@ function iconKey(filename) {
                 HOME.setAlt(elevation);
                 homeElevationPosition = position;
                 $('#elevationValueAtHome').text(elevation + ' m');
+                $('#elevationSourceAtHome').text(elevationSourceLabel(HOME.getElevationSource()));
                 return elevation * 100;
             } catch (error) {
                 console.warn('home elevation lookup failed:', error.message);
@@ -8813,13 +9040,16 @@ function iconKey(filename) {
     };
 
     function terrainSourceText(sources) {
-        switch (sources.overall) {
-            case ElevationSource.TER: return i18n.getMessage('missionTerrainChartSourceTer');
-            case 'mixed': return i18n.getMessage('missionTerrainChartSourceMixed');
-            case ElevationSource.ONLINE_COARSE: return i18n.getMessage('missionTerrainChartSourceCoarse');
-            case ElevationSource.ONLINE: return i18n.getMessage('missionTerrainChartSourceOnline');
-            default: return '';
+        let text;
+        if (sources.overall === ElevationSource.TER) {
+            text = i18n.getMessage('missionTerrainChartSourceTer');
+        } else if (sources.overall === 'mixed') {
+            text = i18n.getMessage('missionTerrainChartSourceMixed');
+        } else {
+            text = elevationSourceLabel(sources.overall);
         }
+        // Interpolated between opentopodata answers: the ground between them is a guess.
+        return text && sources.coarse ? i18n.getMessage('missionTerrainChartSourceCoarse', [text]) : text;
     }
 
     /* The altitude chart drawn from the terrain analysis: the ground, the ground plus
@@ -9192,6 +9422,9 @@ missionControlTab.cleanup = function (callback) {
     // The elevation panel's drag listens on the document, so it outlives the tab unless
     // it is taken off here - reopening the tab would otherwise stack one pair per visit.
     $(document).off('.elevationDrag');
+    // The tile dialog belongs to this visit of the tab; lookups made from other tabs
+    // (or after it closed) must not call into its removed markup.
+    setTileWantedListener(null);
     /* jBox appends its wrapper to body, which the tab switch does not empty, so the
        modal's markup and its ids would stack one copy per visit. */
     $('.jBox-wrapper').remove();

@@ -4,7 +4,7 @@ import { getLength } from 'ol/sphere';
 import { LineString } from 'ol/geom';
 import { fromLonLat } from 'ol/proj';
 import elevationFetch from './elevationFetch';
-import { getElevations, isLocalTerrainActive } from './elevationProvider.js';
+import { getElevations, isLocalTerrainActive, onlineSourceUsesTiles } from './elevationProvider.js';
 import { samplePathEvenly } from './mission_terrain.js';
 
 import MWNP from './mwnp';
@@ -461,10 +461,11 @@ let WaypointCollection = function () {
 
         samples = Math.max(1, samples); // opentopodata rejects < 2 samples (we send samples+1)
 
-        // With a terrain folder chosen the profile is read from the .TER tiles, every
-        // 30 m (their grid spacing) instead of the 60 m / 99 samples the online source
-        // allows. Stretches the folder has no tile for are filled in from the online source.
-        if (isLocalTerrainActive() && point2measure.length >= 2) {
+        // With a terrain folder chosen, or Copernicus or SRTM as the elevation source,
+        // the profile is read every 30 m (the grid spacing of the tiles) instead of the
+        // 60 m / 99 samples opentopodata allows. Each sample says where it came from;
+        // stretches the folder has no tile for are filled in from the chosen source.
+        if ((isLocalTerrainActive() || onlineSourceUsesTiles()) && point2measure.length >= 2) {
             const localSamples = Math.max(1, Math.min(4000, Math.ceil(totalMissionDistance / 30)));
             const path = samplePathEvenly(point2measure.map(item => ({lat: Number(item[0]), lon: Number(item[1])})), localSamples);
             if (path.length === localSamples + 1) {

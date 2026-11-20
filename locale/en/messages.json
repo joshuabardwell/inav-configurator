@@ -5763,14 +5763,11 @@
     "missionTerrainChartSourceTer": {
         "message": "terrain files"
     },
-    "missionTerrainChartSourceOnline": {
-        "message": "online data"
-    },
     "missionTerrainChartSourceMixed": {
-        "message": "terrain files and online data"
+        "message": "mixed sources"
     },
     "missionTerrainChartSourceCoarse": {
-        "message": "online data, coarse: legs are not checked every 30 m"
+        "message": "$1, coarse: legs are not checked every 30 m"
     },
     "missionTerrainFcStock": {
         "message": "This flight controller's firmware has no terrain options for missions. The Floor and Follow legs of this mission will fly as plain legs, straight to the stored altitudes."
@@ -5796,8 +5793,101 @@
     "missionElevationSourceTer": {
         "message": "terrain file"
     },
-    "missionElevationSourceOnline": {
-        "message": "online"
+    "missionElevationSourceCopernicus": {
+        "message": "Copernicus"
+    },
+    "missionElevationSourceCopernicusSaved": {
+        "message": "Copernicus (saved tile)"
+    },
+    "missionElevationSourceSrtmSaved": {
+        "message": "SRTM (saved tile)"
+    },
+    "missionElevationSourceSrtmOnline": {
+        "message": "SRTM (opentopodata)"
+    },
+    "missionElevationSourceAster": {
+        "message": "ASTER"
+    },
+    "missionElevationSourceAsterFallback": {
+        "message": "ASTER (fallback)"
+    },
+    "missionElevationSourceLoading": {
+        "message": "loading"
+    },
+    "missionElevationSourceSetting": {
+        "message": "Elevation source: "
+    },
+    "missionElevationSourceOptCopernicus": {
+        "message": "Copernicus GLO-30"
+    },
+    "missionElevationSourceOptSrtm": {
+        "message": "NASA SRTM 30 m"
+    },
+    "missionElevationSourceOptAster": {
+        "message": "ASTER 30 m"
+    },
+    "missionElevationSourceNoteCopernicus": {
+        "message": "Used where the terrain folder has no file. Most accurate of the three. Where it has no data, ASTER is used. Elevation data: $1."
+    },
+    "missionElevationSourceNoteSrtm": {
+        "message": "Used where the terrain folder has no file. Read from a saved tile, otherwise from opentopodata (one request per second). Where it has no data, ASTER is used."
+    },
+    "missionElevationSourceNoteAster": {
+        "message": "Used where the terrain folder has no file. Read from opentopodata (one request per second). Least accurate of the three."
+    },
+    "missionTileDownloadSetting": {
+        "message": "Terrain tiles: "
+    },
+    "missionTileDownloadOptAsk": {
+        "message": "Ask before downloading"
+    },
+    "missionTileDownloadOptAlways": {
+        "message": "Always download"
+    },
+    "missionTileDownloadOptNever": {
+        "message": "Never download"
+    },
+    "missionTileDialogTitle": {
+        "message": "Download terrain?"
+    },
+    "missionTileDialogOne": {
+        "message": "Download the $1 terrain tile $2 ($3)?"
+    },
+    "missionTileDialogMany": {
+        "message": "Download $1 $2 terrain tiles ($3 in total)?"
+    },
+    "missionTileDialogMore": {
+        "message": "$1 and $2 more"
+    },
+    "missionTileDialogWhy": {
+        "message": "A downloaded tile is saved in the offline data folder for later waypoints and for building .TER files. \"Look up points only\" fetches just what each lookup needs and saves nothing."
+    },
+    "missionTileDialogRemember": {
+        "message": "Don't ask again"
+    },
+    "missionTileDialogDownload": {
+        "message": "Download tile"
+    },
+    "missionTileDialogSkip": {
+        "message": "Look up points only"
+    },
+    "missionTileDialogProgress": {
+        "message": "Downloading $1 of $2: $3"
+    },
+    "missionTileDialogFailed": {
+        "message": "Could not download $1: $2"
+    },
+    "missionTileDialogDone": {
+        "message": "Terrain tile(s) saved: $1"
+    },
+    "missionWebElevationNoticeTitle": {
+        "message": "Terrain elevation in the web version"
+    },
+    "missionWebElevationNotice": {
+        "message": "Ground elevation is not available in the web version: browsers block the elevation servers, and a web page cannot save terrain tiles or read a terrain folder. Elevations show as N/A here. The desktop app has these features."
+    },
+    "missionWebElevationNoticeHide": {
+        "message": "Don't show again"
     },
     "missionParameter1": {
         "message": "Parameter 1:"

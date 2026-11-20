@@ -837,3 +837,28 @@
 .tab-mission-control #geo_info {
     transition: opacity 0.2s;
 }
+
+/* The terrain tile dialog and the web notice (jBox moves them out of the tab, so they
+   are addressed by id): buttons sit under the text instead of over its corner. */
+#terrainTileDialogContent .modal__text,
+#terrainWebNoticeContent .modal__text {
+    margin-bottom: 0.7em;
+}
+
+#terrainTileDialogContent .modal__buttons,
+#terrainWebNoticeContent .modal__buttons {
+    position: static;
+    margin: 1em 0 0 0;
+    text-align: right;
+}
+
+#terrainTileDialogContent .modal__button,
+#terrainWebNoticeContent .modal__button {
+    display: inline-block;
+    margin-left: 8px;
+}
+
+#terrainTileDialogContent .modal__button.disabled {
+    opacity: 0.5;
+    cursor: default;
+}
