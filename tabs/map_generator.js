@@ -22,7 +22,7 @@ import {
 import {
     cellsForBounds, cellsForRange, withNeighbours, cellKey, hasCellFile, cellFileBytes, elevationFile, elevationFileName,
     REGIONS, regionById, BOX_IMAGERY_ZOOM, IMAGERY_LAYERS, imageryLocalPath, tilesInRanges,
-    planDownload, formatBytes, formatDuration, CELL_INDEX_INFO,
+    imageryTotalsByZoom, planDownload, formatBytes, formatDuration, CELL_INDEX_INFO,
 } from './../js/offline_regions.js';
 
 // Fix Leaflet default marker icon paths (broken by bundlers)
@@ -619,6 +619,10 @@ TABS.map_generator.initialize = function (callback) {
         let terrainFallbackPending = false;
         let offlineJob = null;              // the offline download shown in the modal, if any
         let offlinePresent = { srtm: new Set(), copernicus: new Set() };   // file names in the offline folder
+        let offlinePresentGen = 0;          // bumped each time offlinePresent is re-read
+        let offlineFree = null;             // free bytes on the offline folder's drive, null if unknown
+        let offlineEstimateQueued = false;
+        let offlineElevationMemo = { key: null, plan: null };
 
         // ── Initialize tile cache ───────────────────────────────────
         tileCache.init();
@@ -1143,7 +1147,10 @@ TABS.map_generator.initialize = function (callback) {
             }
 
             // In terrain mode, updateTerrainStatus() sets the status area
-            if (isTerrainMode()) return;
+            if (isTerrainMode()) {
+                updateOfflineEstimate();   // the box may have moved (drawn or edited)
+                return;
+            }
 
             const maxZoomTiles = calculateTiles(bounds, maxZ, maxZ);
             let statusHtml =
@@ -1820,6 +1827,7 @@ TABS.map_generator.initialize = function (callback) {
             }
 
             terrainGridLayer.addTo(map);
+            updateOfflineEstimate();   // box deleted, source changed or folder re-read
         }
 
         function updateTerrainStatus() {
@@ -2024,6 +2032,7 @@ TABS.map_generator.initialize = function (callback) {
                 srtm: await offlineStore.elevationNames('srtm'),
                 copernicus: await offlineStore.elevationNames('copernicus'),
             };
+            offlinePresentGen++;
         }
 
         // A cell is ready offline when its own file and the E/N/NE neighbour
@@ -2048,13 +2057,94 @@ TABS.map_generator.initialize = function (callback) {
                 rows.push(`<div>${label}: ${s.files.toLocaleString()} file${s.files > 1 ? 's' : ''}, ${formatBytes(s.bytes)}` +
                     `<a href="#" class="mapgen-offline-clear" data-rel="${rel}" data-label="${label}">Clear</a></div>`);
             }
-            $('#mapgen_offline_sizes').html(rows.join('') || 'The folder has no offline data yet.');
+            $('#mapgen_offline_sizes').html(rows.length
+                ? '<div class="mapgen-offline-estimate-title">Already in the folder</div>' + rows.join('')
+                : 'The folder has no offline data yet.');
         }
 
         async function refreshOfflineView() {
             await refreshOfflinePresent();
+            offlineFree = await globalThis.electronAPI.diskFree(offlineStore.dir()) ?? null;
             if (isTerrainMode()) updateTerrainGrid();
+            updateOfflineEstimate();
             await updateOfflineSizes();
+        }
+
+        // ── Live size estimate ──────────────────────────────────────
+        // Shown in the panel and updated as the region, box, zoom, layers or
+        // elevation source change, so the size is known before Download.
+        // Coalesced to one render per 50 ms: dragging a box edge calls this on
+        // every mouse move. A timer, not requestAnimationFrame, which stops
+        // while the window is hidden.
+        function updateOfflineEstimate() {
+            if (offlineEstimateQueued) return;
+            offlineEstimateQueued = true;
+            setTimeout(() => {
+                offlineEstimateQueued = false;
+                renderOfflineEstimate();
+            }, 50);
+        }
+
+        // The elevation part of the plan, cached: for a big region it walks
+        // tens of thousands of cells (~100 ms for the globe), and it only
+        // changes with the area, the source or the folder's contents.
+        function offlineElevationPlan(area) {
+            const key = JSON.stringify([area.bounds, offlinePresentGen]);
+            if (offlineElevationMemo.key !== key) {
+                offlineElevationMemo = { key, plan: planDownload({ cells: area.cells, present: offlinePresent, imagery: null }) };
+            }
+            return offlineElevationMemo.plan;
+        }
+
+        // Each zoom choice shows how big the imagery would be, for the current
+        // area and layers, so the depth can be picked by size.
+        function updateOfflineZoomLabels(area, layers) {
+            const totals = area && layers.length ? imageryTotalsByZoom(area.bounds, layers, BOX_IMAGERY_ZOOM) : null;
+            $('#mapgen_offline_zoom option').each((_, opt) => {
+                const z = Number.parseInt(opt.value, 10);
+                if (z < 0) return;
+                opt.textContent = totals ? `${z} — ${formatBytes(totals[z].bytes)}` : String(z);
+            });
+        }
+
+        function renderOfflineEstimate() {
+            const $est = $('#mapgen_offline_estimate');
+            if (!offlineStore.available() || !$('#mapgen_offline_box').is(':visible')) return;
+            const area = offlineArea();
+            const layers = offlineLayers();
+            updateOfflineZoomLabels(area, layers);
+            if (!area) {
+                $est.html('<div class="mapgen-offline-note">Draw a box on the map, or pick a region, to see the download size.</div>');
+                return;
+            }
+
+            const source = getTerrainSource();
+            const sourceName = { srtm: 'SRTM', copernicus: 'Copernicus' }[source];
+            const zMax = Number.parseInt($('#mapgen_offline_zoom').val(), 10);
+            const imagery = zMax >= 0 && layers.length ? imageryTotalsByZoom(area.bounds, layers, zMax)[zMax] : null;
+            const plan = offlineElevationPlan(area);
+            const el = plan.elevation[source];
+            const imageryBytes = imagery?.bytes || 0;
+            const needBytes = el.missingBytes + imageryBytes;
+            const tooBig = offlineFree !== null && offlineFree < needBytes;
+
+            const row = (label, value, cls = '') => `<div class="mapgen-offline-estimate-row ${cls}"><span>${label}</span><span>${value}</span></div>`;
+            let html = '<div class="mapgen-offline-estimate-title">This download</div>';
+            html += row(`Elevation (${sourceName}):`, el.files === 0
+                ? 'none needed (sea)'
+                : el.missing.length === 0
+                    ? `all ${el.files.toLocaleString()} files in folder`
+                    : `${formatBytes(el.missingBytes)}, ${el.missing.length.toLocaleString()} of ${el.files.toLocaleString()} files`);
+            html += row('Imagery:', imagery
+                ? `up to ${formatBytes(imageryBytes)}, ${(imagery.tiles * layers.length).toLocaleString()} tiles`
+                : 'none');
+            html += row('Total:', `up to ${formatBytes(needBytes)}`, 'mapgen-offline-estimate-total');
+            if (offlineFree !== null) {
+                html += row('Free space:', formatBytes(offlineFree), tooBig ? 'mapgen-offline-warn' : '');
+            }
+            html += row('Time at 100 Mbit/s:', needBytes > 0 ? formatDuration(needBytes / 12.5e6) : '—');
+            html += row('.TER on SD card:', formatBytes(plan.terBytes[source]));
+            $est.html(html);
         }
 
         function offlineLayers() {
@@ -2307,7 +2397,11 @@ TABS.map_generator.initialize = function (callback) {
         $('#mapgen_offline_region').on('change', () => {
             store.set('mapgen_offline_region', $('#mapgen_offline_region').val());
             setOfflineDefaultZoom();
+            updateOfflineEstimate();
         });
+
+        $('#mapgen_offline_zoom, #mapgen_offline_sat, #mapgen_offline_street, #mapgen_offline_labels')
+            .on('change', () => updateOfflineEstimate());
 
         $('#mapgen_offline_change').on('click', async (e) => {
             e.preventDefault();
