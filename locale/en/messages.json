@@ -406,7 +406,7 @@
         "message": "Open Folder"
     },
     "mapgenTerrainFolderDefault": {
-        "message": "Use Default Folder"
+        "message": "Restore Default"
     },
     "mapgenOfflineHint": {
         "message": "Build terrain files and download map imagery for an area ahead of time, so it is ready without internet. Imagery is kept in this folder:"
@@ -5680,7 +5680,7 @@
         "message": "Open folder"
     },
     "missionTerrainFolderDefault": {
-        "message": "Use default folder"
+        "message": "Restore default"
     },
     "missionTerrainFolderIsDefault": {
         "message": "(default)"
