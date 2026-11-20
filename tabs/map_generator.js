@@ -1819,10 +1819,10 @@ TABS.map_generator.initialize = function (callback) {
             $('#mapgen_offline_box').toggle(showOffline);
             if (showOffline) void refreshOfflineView();
 
-            // Toggle cache UI: tile cache controls for map targets, HGT button for terrain
-            $('.mapgen-cache-row').toggle(!isTerrain);
-            $('#mapgen_cache_enabled').closest('.checkbox').toggle(!isTerrain);
-            $('#mapgen_clear_cache').toggle(!isTerrain);
+            // The tile cache holds map pictures for the radio map targets: its box has
+            // nothing to offer in terrain mode. (The button that deletes the old
+            // elevation cache sits in the Offline Data box, with the other leftovers.)
+            $('#mapgen_tile_cache_box').toggle(!isTerrain);
         }
 
         function updateSdLabel() {
