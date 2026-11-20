@@ -129,11 +129,7 @@ function listenToFolder() {
     stopListening = io.onTerrainChange(event => {
         if (event.type !== 'file' || event.dir !== terFolder) return;
         // A file was written: what was remembered about that cell is out of date.
-        tileExists.delete(event.name);
-        tilesMissing.delete(event.name);
-        for (const key of [...blockCache.keys()]) {
-            if (key.startsWith(event.name + ':')) blockCache.delete(key);
-        }
+        forgetTerFile(event.name);
         sampler.forgetTile(event.lat, event.lon);
     }) || null;
 }
@@ -199,6 +195,61 @@ export function elevationSourceStatus() {
         tilesUsed: [...tilesUsed].sort(),
         tilesMissing: [...tilesMissing].sort()
     };
+}
+
+function forgetTerFile(name) {
+    tileExists.delete(name);
+    tilesUsed.delete(name);
+    tilesMissing.delete(name);
+    for (const key of [...blockCache.keys()]) {
+        if (key.startsWith(name + ':')) blockCache.delete(key);
+    }
+}
+
+export const TerFileState = Object.freeze({
+    PRESENT: 'present',     // the file is in the folder
+    BUILDING: 'building',   // it is being built, or waiting its turn
+    MISSING: 'missing',     // it is not there and nothing is building it
+    NONE: 'none'            // this build keeps no terrain files
+});
+
+/*
+ * Where the terrain file of the cell holding a point stands right now:
+ * { state, name, lat, lon, stale }. The folder is asked each time, not the
+ * memory of earlier lookups, so "missing" is only said of a file that is not
+ * there. stale is true when the lookups had it the other way round (a file
+ * copied in or deleted outside the app): what they remembered about that file
+ * is dropped, and the caller should look its heights up again.
+ */
+export async function terFileState(lat, lon) {
+    const cell = cellOf(Number(lat), Number(lon));
+    const name = terrainDatFilename(cell.lat, cell.lon);
+    const answer = { state: TerFileState.NONE, name, lat: cell.lat, lon: cell.lon, stale: false };
+    if (!isLocalTerrainActive()) {
+        return answer;
+    }
+    if (io.buildPending(cell.lat, cell.lon)) {
+        answer.state = TerFileState.BUILDING;
+        return answer;
+    }
+    const folder = terFolder;
+    let exists = false;
+    try {
+        exists = Boolean(await io.pathExists(tilePath(name)));
+    } catch (error) {
+        exists = false;
+    }
+    if (folder === terFolder && tileExists.has(name) && tileExists.get(name) !== exists) {
+        forgetTerFile(name);
+        answer.stale = true;
+    }
+    // A build may have started while the folder was being asked.
+    if (!exists && io.buildPending(cell.lat, cell.lon)) {
+        answer.state = TerFileState.BUILDING;
+        return answer;
+    }
+    answer.state = exists ? TerFileState.PRESENT : TerFileState.MISSING;
+    return answer;
 }
 
 /* An unknown value counts as "ask". */

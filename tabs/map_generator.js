@@ -1957,7 +1957,8 @@ TABS.map_generator.initialize = function (callback) {
             if (isTerrainMode()) updateTerrainGrid();
         }
 
-        $('#mapgen_terrain_folder_choose').on('click', async (e) => {
+        // The folder's path is the link that chooses another folder.
+        $('#mapgen_terrain_folder_path').on('click', async (e) => {
             e.preventDefault();
             // From the default folder the dialog starts one level up, where
             // "New folder" makes a folder for another area.

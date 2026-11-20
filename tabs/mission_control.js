@@ -87,8 +87,9 @@ import { Geozone, GeozoneVertex, GeozoneType, GeozoneShapes, GeozoneFenceAction 
 import store from './../js/store';
 import dialog from '../js/dialog';
 import {
-    ElevationSource, TileDownload, buildTiles, canBuildTiles, declineTiles, elevationSourceStatus,
-    forgetTerFiles, getElevations, getTileDownload, setTileDownload, setTileWantedListener, summariseSources
+    ElevationSource, TerFileState, TileDownload, buildTiles, canBuildTiles, declineTiles,
+    forgetTerFiles, getElevations, getTileDownload, setTileDownload, setTileWantedListener, summariseSources,
+    terFileState
 } from './../js/elevationProvider.js';
 import { COPERNICUS_NOTICE_1 } from './../js/terrain_elevation.js';
 import { formatBytes } from './../js/offline_regions.js';
@@ -96,7 +97,6 @@ import {
     listTerrain, onTerrainChange, setTerrainFolder, terrainFileInfo, terrainFolderDir, terrainFolderIsDefault,
     terrainFolderParentDir, terrainLibraryAvailable
 } from './../js/terrain_library.js';
-import { terrainCellOfFilename } from './../js/terrain_ter.js';
 import {
     AltitudeReason, MIN_AGL_DEFAULT_M, MIN_AGL_HIGHEST_M, MIN_AGL_LOWEST_M, TerrainDefaults, TerrainMode,
     analyseClearance, clearTerrainBits, legMinM, legMinOverrideM, sampleLegs, supportsTerrainOptions,
@@ -2646,9 +2646,6 @@ function iconKey(filename) {
             ? i18n.getMessage(listing.count === 1 ? 'missionTerrainFolderCountOne' : 'missionTerrainFolderCount',
                 [String(listing.count), formatBytes(listing.bytes)])
             : '');
-        const missing = elevationSourceStatus().tilesMissing;
-        $('#MPterrainFolderStatus').text(missing.length ? i18n.getMessage('missionTerrainFolderMissingTiles', [missing.join(', ')]) : '');
-        $('#MPterrainFolderBuildMissing').toggle(missing.length > 0 && !terrainBuild.busy);
     }
 
     /* Everything on screen that was computed from the old source is looked up again. */
@@ -2737,29 +2734,21 @@ function iconKey(filename) {
         writing: 'missionTerrainBuildStageSaving'
     };
 
-    const terrainBuild = {busy: false};
-
-    /* Builds terrain files into the folder and reports in the log, in the tile dialog
-       (when it is open) and under the folder in the settings box. The heights on
-       screen are refreshed by onTerrainFolderChange as each file is written. */
+    /* Builds terrain files into the folder and reports in the log and in the tile
+       dialog (when it is open). The heights on screen are refreshed by
+       onTerrainFolderChange as each file is written. */
     async function runTerrainBuild(tiles) {
-        terrainBuild.busy = true;
-        $('#MPterrainFolderBuildMissing').hide();
         let outcome = {built: [], failed: [], aborted: false};
         try {
             outcome = await buildTiles(tiles, (step) => {
                 if (!step.tile) return;
                 const stage = i18n.getMessage(TERRAIN_STAGE_LABEL[step.stage] || 'missionTerrainBuildStageConverting');
-                const text = i18n.getMessage('missionTileDialogProgress', [step.tile.name, String(step.done + 1), String(step.total), stage]);
-                $('#terrainTileDialogProgress').text(text);
-                $('#MPterrainBuildStatus').text(text);
+                $('#terrainTileDialogProgress').text(i18n.getMessage('missionTileDialogProgress',
+                    [step.tile.name, String(step.done + 1), String(step.total), stage]));
             });
         } catch (error) {
             outcome.failed = tiles.map(tile => ({tile, error: String(error?.message || error)}));
-        } finally {
-            terrainBuild.busy = false;
         }
-        $('#MPterrainBuildStatus').text('');
         if (outcome.built.length) {
             GUI.log(i18n.getMessage('missionTileDialogDone', [outcome.built.map(tile => tile.name).join(', ')]));
         }
@@ -2770,14 +2759,21 @@ function iconKey(filename) {
         return outcome;
     }
 
-    /* "Build them" next to the list of cells the folder has no file for. */
-    function buildMissingTerrain() {
-        if (terrainBuild.busy) return;
-        const tiles = elevationSourceStatus().tilesMissing
-            .map(name => ({name, cell: terrainCellOfFilename(name)}))
-            .filter(entry => entry.cell)
-            .map(entry => ({key: entry.name, name: entry.name, lat: entry.cell.lat, lon: entry.cell.lon}));
-        if (tiles.length) runTerrainBuild(tiles);
+    /* "Build" next to the height of the selected waypoint, shown when its cell has
+       no terrain file. */
+    async function buildTerrainForSelected() {
+        const wp = selectedMarker;
+        if (!wp) return;
+        const state = await terFileState(wp.getLatMap(), wp.getLonMap());
+        if (state.state !== TerFileState.MISSING) {
+            if (selectedMarker === wp) showElevationSource(wp);
+            return;
+        }
+        const build = runTerrainBuild([{key: state.name, name: state.name, lat: state.lat, lon: state.lon}]);
+        if (selectedMarker === wp) showElevationSource(wp);     // now reads "building"
+        await build;
+        // A build that failed changed nothing in the folder: the label goes back to "no terrain file".
+        if (selectedMarker === wp && wp.getElevationSource() !== ElevationSource.TER) showElevationSource(wp);
     }
 
     /* The tile dialog: lookups report terrain files that are not in the folder; they
@@ -2919,20 +2915,55 @@ function iconKey(filename) {
         }
     }
 
-    /* Says where the elevation shown for a waypoint came from. */
+    let elevationSourceRun = 0;
+
+    /* Says where the elevation shown for the selected waypoint came from. When it
+       did not come from a terrain file, also says how that file stands: being built,
+       or not there (with a link to build it). The folder is asked each time, so "no
+       terrain file" is only said of a file that is not there. */
     function showElevationSource(wp) {
+        const run = ++elevationSourceRun;
         const source = wp && typeof wp.getElevationSource === 'function' ? wp.getElevationSource() : 'none';
         const file = wp && typeof wp.getElevationFile === 'function' ? wp.getElevationFile() : null;
+        const base = elevationSourceLabel(source, file);
         const $label = $('#elevationSourceAtWP');
         $label.toggleClass('fromTerrainFile', source === ElevationSource.TER);
-        $label.text(elevationSourceLabel(source, file));
+        $label.text(base);
+        $('#elevationBuildAtWP').hide();
         if ($('#missionPlannerSettings').is(':visible')) {
             refreshTerrainFolderDisplay();
         }
+        if (!wp || source === ElevationSource.TER || !canBuildTiles() || typeof wp.getLatMap !== 'function') {
+            return;
+        }
+
+        terFileState(wp.getLatMap(), wp.getLonMap()).then((state) => {
+            if (run !== elevationSourceRun || selectedMarker !== wp) return;    // another waypoint, or looked up again
+            let status = '';
+            if (state.state === TerFileState.PRESENT) {
+                // The file is there after all (copied into the folder outside the
+                // app): the height is read again, this time from the file.
+                if (state.stale) refreshGroundClearanceDisplay();
+            } else if (state.state === TerFileState.BUILDING) {
+                status = i18n.getMessage('missionElevationSourceBuilding');
+                // A build that fails sends no event: look again until it has ended.
+                setTimeout(() => {
+                    if (run === elevationSourceRun && selectedMarker === wp) showElevationSource(wp);
+                }, 2000);
+            } else if (state.state === TerFileState.MISSING) {
+                status = i18n.getMessage('missionElevationSourceNoFile');
+                $('#elevationBuildAtWP').show();
+            }
+            if (status) {
+                $label.text(base ? base + ', ' + status : status);
+            }
+        });
     }
 
     /* Shown while a lookup for the selected waypoint is under way. */
     function showElevationLoading() {
+        elevationSourceRun++;
+        $('#elevationBuildAtWP').hide();
         $('#elevationSourceAtWP').removeClass('fromTerrainFile').text(i18n.getMessage('missionElevationSourceLoading'));
     }
 
@@ -8477,7 +8508,7 @@ function iconKey(filename) {
             closeSettingsPanel();
         });
 
-        $('#MPterrainFolderChoose').on('click', async function (event) {
+        $('#MPterrainFolderPath').on('click', async function (event) {
             event.preventDefault();
             // The dialog starts where the folder is. From the default folder it
             // starts one level up, where "New folder" makes a folder for another area.
@@ -8506,9 +8537,9 @@ function iconKey(filename) {
             applyTerrainFolder(null);
         });
 
-        $('#MPterrainFolderBuildMissing').on('click', function (event) {
+        $('#elevationBuildAtWP').on('click', function (event) {
             event.preventDefault();
-            buildMissingTerrain();
+            buildTerrainForSelected();
         });
 
         // Editing a value clears the tick of the previous save
