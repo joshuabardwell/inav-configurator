@@ -619,6 +619,15 @@
     margin-right: 0;
 }
 
+/* With Download for Offline Use the bar holds five buttons, which only just fit the
+   default window: there the two left buttons give up their extra margin, so the labels
+   don't break onto two lines. */
+@media only screen and (max-width: 900px) {
+    .tab-map_generator .content_toolbar .mapgen-toolbar-left a {
+        margin-left: 5px;
+    }
+}
+
 .tab-map_generator .content_toolbar #mapgen_restore_settings_btn a {
     background-color: #fff;
     border: 1px solid #2980b9;

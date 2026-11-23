@@ -1817,6 +1817,8 @@ TABS.map_generator.initialize = function (callback) {
             // Offline data panel: terrain mode, desktop app only (needs a folder)
             const showOffline = isTerrain && offlineStore.available();
             $('#mapgen_offline_box').toggle(showOffline);
+            // Its download button sits in the bottom bar, beside Sync to SD Card
+            $('#mapgen_offline_download_btn').toggle(showOffline);
             if (showOffline) void refreshOfflineView();
 
             // The tile cache holds map pictures for the radio map targets: its box has
@@ -2089,7 +2091,7 @@ TABS.map_generator.initialize = function (callback) {
                 : ter.missing.length === 0
                     ? `all ${ter.files.toLocaleString()} in the terrain folder`
                     : `${ter.missing.length.toLocaleString()} of ${ter.files.toLocaleString()} to build, ${formatBytes(ter.terBytes)} on disk`);
-            html += row('Elevation download:', ter.downloadBytes > 0 ? `about ${formatBytes(ter.downloadBytes)} (not kept)` : 'none');
+            html += row('Elevation download:', ter.downloadBytes > 0 ? `about ${formatBytes(ter.downloadBytes)}` : 'none');
             html += row('Imagery:', imagery
                 ? `up to ${formatBytes(imageryBytes)}, ${(imagery.tiles * layers.length).toLocaleString()} tiles`
                 : 'none');
@@ -2170,7 +2172,7 @@ TABS.map_generator.initialize = function (callback) {
                 offlineInfoRow('Terrain files:', `${ter.files.toLocaleString()} · ${ter.present.toLocaleString()} already in the folder · ${ter.missing.length.toLocaleString()} to build`) +
                 offlineInfoRow('Terrain on disk:', `${formatBytes(ter.terBytes)} to add (all files: ${formatBytes(ter.totalTerBytes)})`) +
                 offlineInfoRow('Elevation download:', ter.downloadBytes > 0
-                    ? `about ${formatBytes(ter.downloadBytes)}; it is turned into .TER files and not kept` : 'none');
+                    ? `about ${formatBytes(ter.downloadBytes)}` : 'none');
             if (plan.imagery) {
                 const names = { esri_satellite: 'satellite', esri_street: 'street', esri_labels: 'labels' };
                 html += offlineInfoRow('Imagery:', `Esri ${plan.imagery.layers.map(id => names[id]).join(' + ')}, zoom 0–${plan.imagery.zMax}`) +

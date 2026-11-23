@@ -197,7 +197,6 @@
                             <label for="mapgen_offline_labels"><span data-i18n="mapgenOfflineLabels">Esri road labels</span></label>
                         </div>
                         <div id="mapgen_offline_estimate" class="mapgen-offline-estimate"></div>
-                        <a id="mapgen_offline_download" class="btn" href="#" data-i18n="mapgenOfflineDownload">Download for Offline Use</a>
 
                         <div id="mapgen_offline_sizes" class="mapgen-offline-sizes"></div>
                         <a id="mapgen_clear_hgt_cache" class="btn" href="#" style="display:none; margin-top:6px;">Delete old elevation cache</a>
@@ -227,6 +226,10 @@
         </div>
         <div class="btn mapgen-toolbar-left" id="mapgen_restore_settings_btn">
             <a href="#" data-i18n="mapgenRestoreSettings">Restore Defaults</a>
+        </div>
+        <!-- Shown with the Offline Data box (INAV Terrain target, desktop app) -->
+        <div class="btn" id="mapgen_offline_download_btn" style="display:none;">
+            <a class="save" id="mapgen_offline_download" href="#" data-i18n="mapgenOfflineDownload">Download for Offline Use</a>
         </div>
         <div class="btn" id="mapgen_sync_btn">
             <a class="save" href="#" data-i18n="mapgenSyncToSD">Sync to SD Card</a>
