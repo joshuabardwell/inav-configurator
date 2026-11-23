@@ -27,7 +27,7 @@ import {
 } from './../js/offline_regions.js';
 import { buildCellTer, pruneImageCache } from './../js/terrain_build.js';
 import {
-    buildTerrain, copyTerrainTo, listTerrain, onTerrainChange, setTerrainFolder, terrainFilePath,
+    buildTerrain, copyFailureText, copyTerrainTo, listTerrain, onTerrainChange, setTerrainFolder, terrainFilePath,
     terrainFolderDir, terrainFolderIsDefault, terrainFolderParentDir, terrainLibraryAvailable, terrainNoticeText,
     TERRAIN_NOTICE_FILE, TerrainFileState,
 } from './../js/terrain_library.js';
@@ -1817,6 +1817,8 @@ TABS.map_generator.initialize = function (callback) {
             // Offline data panel: terrain mode, desktop app only (needs a folder)
             const showOffline = isTerrain && offlineStore.available();
             $('#mapgen_offline_box').toggle(showOffline);
+            // Its download button sits in the bottom bar, beside Sync to SD Card
+            $('#mapgen_offline_download_btn').toggle(showOffline);
             if (showOffline) void refreshOfflineView();
 
             // The tile cache holds map pictures for the radio map targets: its box has
@@ -2089,7 +2091,7 @@ TABS.map_generator.initialize = function (callback) {
                 : ter.missing.length === 0
                     ? `all ${ter.files.toLocaleString()} in the terrain folder`
                     : `${ter.missing.length.toLocaleString()} of ${ter.files.toLocaleString()} to build, ${formatBytes(ter.terBytes)} on disk`);
-            html += row('Elevation download:', ter.downloadBytes > 0 ? `about ${formatBytes(ter.downloadBytes)} (not kept)` : 'none');
+            html += row('Elevation download:', ter.downloadBytes > 0 ? `about ${formatBytes(ter.downloadBytes)}` : 'none');
             html += row('Imagery:', imagery
                 ? `up to ${formatBytes(imageryBytes)}, ${(imagery.tiles * layers.length).toLocaleString()} tiles`
                 : 'none');
@@ -2170,7 +2172,7 @@ TABS.map_generator.initialize = function (callback) {
                 offlineInfoRow('Terrain files:', `${ter.files.toLocaleString()} · ${ter.present.toLocaleString()} already in the folder · ${ter.missing.length.toLocaleString()} to build`) +
                 offlineInfoRow('Terrain on disk:', `${formatBytes(ter.terBytes)} to add (all files: ${formatBytes(ter.totalTerBytes)})`) +
                 offlineInfoRow('Elevation download:', ter.downloadBytes > 0
-                    ? `about ${formatBytes(ter.downloadBytes)}; it is turned into .TER files and not kept` : 'none');
+                    ? `about ${formatBytes(ter.downloadBytes)}` : 'none');
             if (plan.imagery) {
                 const names = { esri_satellite: 'satellite', esri_street: 'street', esri_labels: 'labels' };
                 html += offlineInfoRow('Imagery:', `Esri ${plan.imagery.layers.map(id => names[id]).join(' + ')}, zoom 0–${plan.imagery.zMax}`) +
@@ -2571,7 +2573,7 @@ TABS.map_generator.initialize = function (callback) {
             });
             if (syncAborted) return;
             for (const failure of result.failed) console.warn(`Failed: ${failure.name}: ${failure.error}`);
-            showTerrainComplete(names.length, result.failed.length, result.skipped.length, true, notBuilt);
+            showTerrainComplete(names.length, result.failed, result.skipped.length, true, notBuilt);
         }
 
         async function downloadTerrainZip(files, notBuilt) {
@@ -2604,17 +2606,19 @@ TABS.map_generator.initialize = function (callback) {
             if (!result.canceled && result.filePath) {
                 await globalThis.electronAPI.writeFile(result.filePath, new Uint8Array(blob));
             }
-            showTerrainComplete(added, 0, 0, false, notBuilt);
+            showTerrainComplete(added, [], 0, false, notBuilt);
         }
 
-        function showTerrainComplete(total, failedCount, skipped, isSD, notBuilt = []) {
+        // failed: copyTerrainTo's list of files that could not be copied to the card
+        function showTerrainComplete(total, failed, skipped, isSD, notBuilt = []) {
             skipped = skipped || 0;
             const esc = s => $('<span>').text(s).html();
             const notBuiltText = notBuilt.length
                 ? `${notBuilt.length} file(s) could not be built: ${notBuilt.map(f => f.name).join(', ')} (${notBuilt[0].error})`
                 : '';
-            if (failedCount > 0) {
-                $('#mapgen_download_status').text(`Done with ${failedCount} error(s).${skipped > 0 ? ` ${skipped} skipped (already existed).` : ''}${notBuiltText ? ' ' + notBuiltText + '.' : ''}`);
+            if (failed.length > 0) {
+                $('#mapgen_modal_header').text('Sync Finished with Errors');
+                $('#mapgen_download_status').text(`Done with ${copyFailureText(failed)}.${skipped > 0 ? ` ${skipped} skipped (already existed).` : ''}${notBuiltText ? ' ' + notBuiltText + '.' : ''}`);
             } else {
                 const written = total - skipped;
                 let summary = `${written} .TER file(s) written`;

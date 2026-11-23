@@ -5,7 +5,7 @@ import {
     configureTerrainLibrary, terrainLibraryAvailable,
     terrainFolderDir, terrainFolderDefaultDir, terrainFolderParentDir, terrainFolderIsDefault, setTerrainFolder,
     terrainFilePath, onTerrainChange, parseTerrainIndex, listTerrain, terrainFileInfo,
-    terFileBytes, buildTerrain, terrainBuildPending, copyTerrainTo, terrainNoticeText,
+    terFileBytes, buildTerrain, terrainBuildPending, copyTerrainTo, copyFailureText, terrainNoticeText,
     TERRAIN_FOLDER_KEY, TERRAIN_INDEX_FILE, TERRAIN_NOTICE_FILE, TerrainFileState
 } from '../js/terrain_library.js';
 import { TER_GENERATOR_VERSION } from '../js/terrain_build.js';
@@ -339,4 +339,25 @@ test('copyTerrainTo copies what is missing or differs, and reports the rest', as
 
     const forced = await copyTerrainTo(['N47E008.TER'], 'E:', { overwrite: true });
     assert.deepEqual(forced.copied, ['N47E008.TER']);
+});
+
+test('copyTerrainTo writes straight into a card root as the folder dialog names it', async () => {
+    const { disk } = fakeHost({ files: { [DEFAULT_DIR + '/N34W112.TER']: 'aaaa' } });
+    const result = await copyTerrainTo(['N34W112.TER'], 'J:\\');
+    assert.deepEqual(result.copied, ['N34W112.TER']);
+    assert.equal(disk.get('J:\\N34W112.TER'), 'aaaa');
+});
+
+test('copyFailureText gives the count and the reason of the first failed copy', async () => {
+    assert.equal(copyFailureText([]), '');
+    assert.equal(copyFailureText(undefined), '');
+    assert.equal(copyFailureText([
+        { name: 'N34W112.TER', error: "EPERM: operation not permitted, mkdir 'J:\\'" },
+        { name: 'N34W113.TER', error: 'other' }
+    ]), "2 error(s). First: N34W112.TER: EPERM: operation not permitted, mkdir 'J:\\'");
+
+    // From a real run: the reason copyTerrainTo recorded is what the dialog shows
+    fakeHost({ files: { [DEFAULT_DIR + '/N47E008.TER']: 'aaaa' } });
+    const result = await copyTerrainTo(['N47E008.TER', 'N10E010.TER'], 'E:');
+    assert.equal(copyFailureText(result.failed), '1 error(s). First: N10E010.TER: not in the terrain folder');
 });

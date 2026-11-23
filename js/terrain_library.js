@@ -461,3 +461,14 @@ export async function copyTerrainTo(names, destDir, { overwrite = false, onProgr
     }
     return result;
 }
+
+/*
+ * One line for the Sync dialog from copyTerrainTo's `failed` list: how many
+ * copies failed and why the first one did, e.g. "12 error(s). First:
+ * N34W112.TER: EPERM: operation not permitted". '' when nothing failed.
+ */
+export function copyFailureText(failed) {
+    if (!failed?.length) return '';
+    const first = failed[0];
+    return `${failed.length} error(s). First: ${first.name}: ${first.error}`;
+}

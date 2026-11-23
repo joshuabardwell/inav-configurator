@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { downloadToFile, writeFileAtomic, copyFileAtomic, ensureFolder, listFiles, dirSize, diskFree } from '../js/main/offline_store.js';
+import { downloadToFile, writeFileAtomic, copyFileAtomic, ensureFolder, ensureParentDir, makeDir, listFiles, dirSize, diskFree } from '../js/main/offline_store.js';
 
 async function withTempDir(fn) {
     const dir = await mkdtemp(path.join(tmpdir(), 'offline-store-'));
@@ -63,6 +63,42 @@ test('ensureFolder creates a folder and refuses a file or a relative path', () =
     assert.equal(typeof await ensureFolder(file), 'string');
     assert.equal(typeof await ensureFolder('relative/folder'), 'string');
 }));
+
+// Windows refuses mkdir on a drive root with EPERM, even with { recursive: true }.
+function fakeFs({ folderExists, isFile = false }) {
+    const calls = [];
+    return {
+        calls,
+        mkdir: async (dir, opts) => {
+            calls.push(['mkdir', dir, opts]);
+            throw Object.assign(new Error(`EPERM: operation not permitted, mkdir '${dir}'`), { code: 'EPERM' });
+        },
+        stat: async (dir) => {
+            calls.push(['stat', dir]);
+            if (!folderExists && !isFile) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+            return { isDirectory: () => folderExists };
+        },
+    };
+}
+
+test('makeDir carries on when mkdir throws for a folder that is there (an SD card root)', async () => {
+    const fs = fakeFs({ folderExists: true });
+    await makeDir('J:\\', fs);
+    assert.deepEqual(fs.calls, [['mkdir', 'J:\\', { recursive: true }], ['stat', 'J:\\']]);
+});
+
+test('makeDir keeps the mkdir error when the folder is missing or is a file', async () => {
+    await assert.rejects(makeDir('J:\\', fakeFs({ folderExists: false })), { code: 'EPERM' });
+    await assert.rejects(makeDir('J:\\file.txt', fakeFs({ folderExists: false, isFile: true })), { code: 'EPERM' });
+});
+
+test('a drive root is accepted as the folder for a file', async () => {
+    // The real file system, nothing written: on Windows this is the mkdir that
+    // failed for every file of a Sync to a card's root.
+    const root = path.parse(tmpdir()).root;
+    await ensureParentDir(path.join(root, 'N34W112.TER'));
+    assert.equal(await ensureFolder(root), false);
+});
 
 test('downloadToFile refuses non-https URLs and skips existing files', () => withTempDir(async dir => {
     const dest = path.join(dir, 'f.bin');
