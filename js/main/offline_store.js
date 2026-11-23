@@ -26,6 +26,28 @@ async function exists(file) {
     }
 }
 
+// Creates dir and its parents if they are missing. On Windows mkdir throws
+// EPERM for a drive root ("J:\") even with { recursive: true }, which made
+// every copy to an SD card's root fail. So when mkdir throws and the folder is
+// there anyway, carry on: the write that follows reports any real problem.
+// `fs` is only replaced by tests.
+export async function makeDir(dir, fs = { mkdir, stat }) {
+    try {
+        await fs.mkdir(dir, { recursive: true });
+    } catch (err) {
+        let isFolder = false;
+        try {
+            isFolder = (await fs.stat(dir)).isDirectory();
+        } catch { /* not there: the mkdir error stands */ }
+        if (!isFolder) throw err;
+    }
+}
+
+// Makes sure the folder that will hold `file` exists.
+export function ensureParentDir(file, fs) {
+    return makeDir(path.dirname(file), fs);
+}
+
 // Downloads url to dest through dest.part, renamed into place only when the
 // whole body arrived (and matches Content-Length when the server sends one), so
 // a stopped run never leaves a truncated file that a later run would trust.
@@ -46,7 +68,7 @@ export async function downloadToFile(url, dest, opts = {}) {
             await resp.body?.cancel().catch(() => {});
             return { status: resp.status, bytes: 0 };
         }
-        await mkdir(path.dirname(dest), { recursive: true });
+        await ensureParentDir(dest);
         await pipeline(Readable.fromWeb(resp.body), createWriteStream(part), { signal });
         const { size } = await stat(part);
         // With a Content-Encoding, fetch decodes the body and Content-Length is
@@ -70,7 +92,7 @@ export async function downloadToFile(url, dest, opts = {}) {
 export async function writeFileAtomic(dest, data) {
     const part = dest + '.part';
     try {
-        await mkdir(path.dirname(dest), { recursive: true });
+        await ensureParentDir(dest);
         await writeFile(part, data);
         await rename(part, dest);
         return false;
@@ -86,7 +108,7 @@ export async function writeFileAtomic(dest, data) {
 export async function copyFileAtomic(src, dest) {
     const part = dest + '.part';
     try {
-        await mkdir(path.dirname(dest), { recursive: true });
+        await ensureParentDir(dest);
         await copyFile(src, part);
         await rename(part, dest);
         return false;
@@ -102,7 +124,7 @@ export async function copyFileAtomic(src, dest) {
 export async function ensureFolder(dir) {
     if (typeof dir !== 'string' || !path.isAbsolute(dir)) return 'not an absolute path';
     try {
-        await mkdir(dir, { recursive: true });
+        await makeDir(dir);
         const s = await stat(dir);
         return s.isDirectory() ? false : 'not a folder';
     } catch (err) {

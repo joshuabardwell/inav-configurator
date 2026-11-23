@@ -27,7 +27,7 @@ import {
 } from './../js/offline_regions.js';
 import { buildCellTer, pruneImageCache } from './../js/terrain_build.js';
 import {
-    buildTerrain, copyTerrainTo, listTerrain, onTerrainChange, setTerrainFolder, terrainFilePath,
+    buildTerrain, copyFailureText, copyTerrainTo, listTerrain, onTerrainChange, setTerrainFolder, terrainFilePath,
     terrainFolderDir, terrainFolderIsDefault, terrainFolderParentDir, terrainLibraryAvailable, terrainNoticeText,
     TERRAIN_NOTICE_FILE, TerrainFileState,
 } from './../js/terrain_library.js';
@@ -2571,7 +2571,7 @@ TABS.map_generator.initialize = function (callback) {
             });
             if (syncAborted) return;
             for (const failure of result.failed) console.warn(`Failed: ${failure.name}: ${failure.error}`);
-            showTerrainComplete(names.length, result.failed.length, result.skipped.length, true, notBuilt);
+            showTerrainComplete(names.length, result.failed, result.skipped.length, true, notBuilt);
         }
 
         async function downloadTerrainZip(files, notBuilt) {
@@ -2604,17 +2604,19 @@ TABS.map_generator.initialize = function (callback) {
             if (!result.canceled && result.filePath) {
                 await globalThis.electronAPI.writeFile(result.filePath, new Uint8Array(blob));
             }
-            showTerrainComplete(added, 0, 0, false, notBuilt);
+            showTerrainComplete(added, [], 0, false, notBuilt);
         }
 
-        function showTerrainComplete(total, failedCount, skipped, isSD, notBuilt = []) {
+        // failed: copyTerrainTo's list of files that could not be copied to the card
+        function showTerrainComplete(total, failed, skipped, isSD, notBuilt = []) {
             skipped = skipped || 0;
             const esc = s => $('<span>').text(s).html();
             const notBuiltText = notBuilt.length
                 ? `${notBuilt.length} file(s) could not be built: ${notBuilt.map(f => f.name).join(', ')} (${notBuilt[0].error})`
                 : '';
-            if (failedCount > 0) {
-                $('#mapgen_download_status').text(`Done with ${failedCount} error(s).${skipped > 0 ? ` ${skipped} skipped (already existed).` : ''}${notBuiltText ? ' ' + notBuiltText + '.' : ''}`);
+            if (failed.length > 0) {
+                $('#mapgen_modal_header').text('Sync Finished with Errors');
+                $('#mapgen_download_status').text(`Done with ${copyFailureText(failed)}.${skipped > 0 ? ` ${skipped} skipped (already existed).` : ''}${notBuiltText ? ' ' + notBuiltText + '.' : ''}`);
             } else {
                 const written = total - skipped;
                 let summary = `${written} .TER file(s) written`;
