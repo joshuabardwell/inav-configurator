@@ -182,7 +182,7 @@ export const TerrainDefaults = Object.freeze({
                                 // and a terrain leg descends no faster than that
     altResponse: 0.4,           // nav_fw_alt_control_response (40): climb rate = 0.4 x altitude error
     leadFadeM: 10,              // TERRAIN_NAV_MISSION_LEAD_FADE_CM: the planned-climb lead is full from here
-    riseWindowS: 1,             // the measured lead: the target's rise over the last second
+    riseWindowS: 1,             // the measured lead: the ground's rise over the last second
     lookaheadM: 1000,           // terrain_nav_lookahead
     cacheBlocks: 8,             // terrain block cache: 8 on boards with 512 kB RAM or more, else 4
     recoverMarginM: 10,         // TERRAIN_NAV_HOLD_RECOVER_MARGIN_CM: the hold keeps minimum + 10 m
@@ -248,16 +248,18 @@ export function plannedLeadM(climbNeededM, plannedClimbMs, altResponse, fadeM = 
     return fade > 0 ? fade * lagM(plannedClimbMs, altResponse) : 0;
 }
 
-/* Lead for the rate the terrain target itself rose at: only a rise, and no faster than
-   the altitude controller may command a climb. */
+/* Lead for the rate the ground under the aircraft rose at: only a rise, and no faster
+   than the altitude controller may command a climb. */
 export function measuredLeadM(riseRateMs, maxClimbMs, altResponse) {
     return riseRateMs > 0 ? lagM(Math.min(riseRateMs, maxClimbMs), altResponse) : 0;
 }
 
-/* The terrain target with its leads. holdTargetM: the higher of the held height and the
-   climb line; climbing: the look-ahead asks for a climb. */
-export function leadTargetM(holdTargetM, climbing, lineM, plannedLead, measuredLead) {
-    const targetM = holdTargetM + measuredLead;
+/* The terrain target with its leads: the higher of the held height with the measured
+   lead and, while the look-ahead asks for a climb, the climb line with the planned-climb
+   lead. heldAltM: the ground + the height above it the leg holds. The climb line gets
+   no measured lead: it moves in steps, and the lead would put 2.5 times each on top. */
+export function leadTargetM(heldAltM, climbing, lineM, plannedLead, measuredLead) {
+    const targetM = heldAltM + measuredLead;
     return climbing && lineM + plannedLead > targetM ? lineM + plannedLead : targetM;
 }
 
@@ -300,14 +302,15 @@ function respond(altM, targetM, seconds, p, maxDescentMs = p.climbRateMs) {
  *   follow     ground + the waypoint's own clearance (never less than minimum + 10 m),
  *              with the same early raise
  *   leads      the terrain target is raised by what the altitude controller would
- *              otherwise lag behind it: while the look-ahead asks for a climb, and
- *              while the target itself rises
+ *              otherwise lag behind it: the climb line while the look-ahead asks for
+ *              a climb, the held height while the ground under the aircraft rises
  *   descent    on a terrain leg no faster than the climb the look-ahead plans with
  *   data lost  never below the last terrain target, still following a higher stock line
  *
  * Not modelled: the scan across the width of a turn (the planner scans along the
- * route), and the cycles a new leg waits for its own answers, during which the
- * firmware keeps the target of the leg before.
+ * route), the cycles a new leg waits for its own answers, during which the
+ * firmware keeps the target of the leg before, and the ground speed, which the
+ * firmware's scan takes smoothed over 10 s and the planner as one fixed value.
  */
 export function predictAltitude({ route, sampling, terrainM, globalMinM, params = {}, ignoreModes = false }) {
     const p = { ...TerrainDefaults, ...params };
@@ -358,20 +361,20 @@ export function predictAltitude({ route, sampling, terrainM, globalMinM, params 
     reason[0] = z === null ? AltitudeReason.UNKNOWN : AltitudeReason.PLANNED;
     let lastTerrainTarget = null;
 
-    // The rise of the hold's target, for the measured lead: the increments of the last
-    // second of flight (always the latest one), newest last. An increment is taken
-    // between two samples of the same leg that both have ground data.
+    // The rise of the ground under the aircraft, for the measured lead: the increments
+    // of the last second of flight (always the latest one), newest last. An increment
+    // is taken between two samples that both have ground data.
     let rises = [];
     let riseFrom = null;
-    function riseRateMs(legIndex, holdTargetM, seconds) {
-        if (riseFrom !== null && riseFrom.legIndex === legIndex && seconds > 0) {
-            rises.push({ riseM: holdTargetM - riseFrom.holdTargetM, seconds });
+    function riseRateMs(groundM, seconds) {
+        if (riseFrom !== null && seconds > 0) {
+            rises.push({ riseM: groundM - riseFrom, seconds });
             let kept = 0;
             let first = rises.length;
             while (first > 0 && kept < p.riseWindowS) kept += rises[--first].seconds;
             rises = rises.slice(first);
         }
-        riseFrom = { legIndex, holdTargetM };
+        riseFrom = groundM;
         const total = rises.reduce((sum, r) => sum + r.seconds, 0);
         return total > 0 ? rises.reduce((sum, r) => sum + r.riseM, 0) / total : 0;
     }
@@ -415,10 +418,9 @@ export function predictAltitude({ route, sampling, terrainM, globalMinM, params 
                     const heldM = heldHeightM(info.mode, info.clearanceM, info.minM, p.recoverMarginM);
                     const neededM = climbNeededAhead(k, i);
                     const lineM = climbLineM(groundM, info.minM, p.recoverMarginM, neededM);
-                    const holdTargetM = neededM > 0 ? Math.max(groundM + heldM, lineM) : groundM + heldM;
-                    const terrainTargetM = leadTargetM(holdTargetM, neededM > 0, lineM,
+                    const terrainTargetM = leadTargetM(groundM + heldM, neededM > 0, lineM,
                         plannedLeadM(neededM, plannedClimbMs, p.altResponse, p.leadFadeM),
-                        measuredLeadM(riseRateMs(i, holdTargetM, seconds), p.climbRateMs, p.altResponse));
+                        measuredLeadM(riseRateMs(groundM, seconds), p.climbRateMs, p.altResponse));
                     lastTerrainTarget = terrainTargetM;
                     maxDescentMs = plannedClimbMs;
                     if (following) {

@@ -426,6 +426,8 @@ describe('terrain target and the altitude controller', () => {
         assert.equal(leadTargetM(520, false, 9999, 25, 6), 526);
         assert.equal(leadTargetM(520, true, 510, 25, 6), 535);
         assert.equal(leadTargetM(520, true, 490, 25, 6), 526);
+        assert.equal(leadTargetM(520, true, 521, 2.5, 50), 570, 'the measured lead goes on the held height, never on the climb line');
+        assert.equal(leadTargetM(520, true, 560, 25, 50), 585);
         assert.equal(limitDescentM(450, 550, 10, 0.4), 525);
         assert.equal(limitDescentM(540, 550, 10, 0.4), 540);
         assert.equal(limitDescentM(580, 550, 10, 0.4), 580);
