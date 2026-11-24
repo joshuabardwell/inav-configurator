@@ -10,14 +10,22 @@ import {
     TerrainMode,
     analyseClearance,
     clearTerrainBits,
+    climbLineM,
+    heldHeightM,
+    lagM,
+    leadTargetM,
     legMinM,
     legMinOverrideM,
+    limitDescentM,
     lookaheadDistanceM,
+    measuredLeadM,
+    plannedLeadM,
     predictAltitude,
     sampleLegs,
     samplePathEvenly,
     supportsTerrainOptions,
     terrainModeOfP3,
+    turnExtraRiseM,
     withLegMin,
     withTerrainMode
 } from '../js/mission_terrain.js';
@@ -393,5 +401,110 @@ describe('clearance analysis', () => {
         assert.ok(Math.abs(result.altM[result.altM.length - 1] - 420) < 1);
         assert.equal(result.legs[1].noData, true);
         assert.equal(result.belowRanges.length, 0, 'no clearance can be judged without terrain');
+    });
+});
+
+// The firmware's rules for the target a terrain leg hands to the altitude controller
+// (terrain_nav_mission_logic.h). tools/compare_terrain_rules.mjs checks these functions
+// against the firmware's own on a grid of inputs.
+describe('terrain target and the altitude controller', () => {
+    const near = (a, b, tolerance = 1e-9) => Math.abs(a - b) <= tolerance;
+
+    test('the lag of a rising target, and the leads that cancel it', () => {
+        assert.ok(near(lagM(10, 0.4), 25), 'a target rising 10 m/s leaves the aircraft 25 m under it');
+        assert.equal(plannedLeadM(0, 10, 0.4), 0);
+        assert.equal(plannedLeadM(-3, 10, 0.4), 0);
+        assert.ok(near(plannedLeadM(5, 10, 0.4), 12.5), 'fades in over the first 10 m the look-ahead asks for');
+        assert.ok(near(plannedLeadM(90, 10, 0.4), 25));
+        assert.ok(near(measuredLeadM(8, 20, 0.4), 20));
+        assert.equal(measuredLeadM(-9, 20, 0.4), 0);
+        assert.ok(near(measuredLeadM(30, 20, 0.4), 50), "no more than the lag of the controller's fastest climb");
+    });
+
+    test('the target with its leads, the climb line and the descent limit', () => {
+        assert.equal(climbLineM(400, 60, 10, 50), 520);
+        assert.equal(leadTargetM(520, false, 9999, 25, 6), 526);
+        assert.equal(leadTargetM(520, true, 510, 25, 6), 535);
+        assert.equal(leadTargetM(520, true, 490, 25, 6), 526);
+        assert.equal(limitDescentM(450, 550, 10, 0.4), 525);
+        assert.equal(limitDescentM(540, 550, 10, 0.4), 540);
+        assert.equal(limitDescentM(580, 550, 10, 0.4), 580);
+    });
+
+    test('the height a leg holds and the extra rise past a waypoint', () => {
+        assert.equal(heldHeightM(TerrainMode.FLOOR, 200, 60, 10), 70);
+        assert.equal(heldHeightM(TerrainMode.FOLLOW, 90, 60, 10), 90);
+        assert.equal(heldHeightM(TerrainMode.FOLLOW, 65, 60, 10), 70);
+        assert.equal(heldHeightM(TerrainMode.FOLLOW, null, 60, 10), 70);
+        assert.equal(turnExtraRiseM(60, 100), 40);
+        assert.equal(turnExtraRiseM(100, 60), -40);
+    });
+
+    // A follow leg up a steady slope, then level: 4 m/s of ground rise at 20 m/s.
+    function slopeLeg(params) {
+        const ground = (d) => 400 + 0.2 * Math.min(Math.max(d - 1000, 0), 3000);
+        const route = northRoute([
+            { atM: 0, altAmslM: ground(0) + 90 },
+            { atM: 6000, altAmslM: ground(6000) + 90, p3: p3With(TerrainMode.FOLLOW) }
+        ]);
+        const sampling = sampleLegs(route);
+        const terrainM = terrainAlong(sampling, ground);
+        return { sampling, result: analyseClearance({ route, sampling, terrainM, globalMinM: 60, params }) };
+    }
+
+    test('follow: on a steady slope the aircraft holds its clearance, not the clearance less the lag', () => {
+        // No look-ahead: the measured lead alone. Without it the aircraft would settle
+        // 4 / 0.4 = 10 m under its clearance.
+        const { sampling, result } = slopeLeg({ speedMs: 20, climbRateMs: 10, lookaheadM: 0 });
+        const onSlope = sampling.samples
+            .map((sample, k) => ({ distM: sample.distM, clearanceM: result.clearanceM[k] }))
+            .filter(({ distM }) => distM > 2000 && distM < 4000);
+        assert.ok(onSlope.length > 30);
+        for (const { distM, clearanceM } of onSlope) {
+            // (the prediction steps 1.5 s at a time and reads each step's target at its end,
+            // which puts it a few metres high on a slope)
+            assert.ok(Math.abs(clearanceM - 90) < 5, `at ${distM} m: clearance ${clearanceM}`);
+        }
+    });
+
+    test('a climb the look-ahead asks for is flown above the bare minimum', () => {
+        // The ridge of the floor test, with a plane whose planned climb (5 m/s) leaves a
+        // lag of 12.5 m: it still crosses with more than the minimum in hand.
+        const route = northRoute([
+            { atM: 0, altAmslM: 500 }, { atM: 6000, altAmslM: 500, p3: p3With(TerrainMode.FLOOR) }
+        ]);
+        const sampling = sampleLegs(route);
+        const terrainM = terrainAlong(sampling, ridge(2500, 300, 120));
+        const result = analyseClearance({ route, sampling, terrainM, globalMinM: 60, params: { speedMs: 20, climbRateMs: 10 } });
+        assert.equal(result.belowRanges.length, 0);
+        assert.ok(result.legs[1].lowestClearanceM >= 65, `lowest clearance ${result.legs[1].lowestClearanceM}`);
+    });
+
+    test('a terrain leg descends no faster than the climb the look-ahead plans with', () => {
+        // Follow over a 150 m cliff: the aircraft comes down at 5 m/s (half of 10), not 10.
+        const ground = (d) => (d < 2000 ? 550 : 400);
+        const route = northRoute([
+            { atM: 0, altAmslM: ground(0) + 90 },
+            { atM: 6000, altAmslM: ground(6000) + 90, p3: p3With(TerrainMode.FOLLOW) }
+        ]);
+        const sampling = sampleLegs(route);
+        const terrainM = terrainAlong(sampling, ground);
+        const params = { speedMs: 20, climbRateMs: 10 };
+        const { altM } = predictAltitude({ route, sampling, terrainM, globalMinM: 60, params });
+        let fastest = 0;
+        for (let k = 1; k < altM.length; k++) {
+            const seconds = (sampling.samples[k].distM - sampling.samples[k - 1].distM) / params.speedMs;
+            fastest = Math.min(fastest, (altM[k] - altM[k - 1]) / seconds);
+        }
+        assert.ok(fastest < -4.9 && fastest > -5.01, `fastest descent ${fastest} m/s`);
+        assert.ok(Math.abs(altM[altM.length - 1] - 490) < 1, 'and still arrives at its clearance');
+
+        // A stock leg keeps the altitude controller's own limit
+        const stock = northRoute([{ atM: 0, altAmslM: 700 }, { atM: 1000, altAmslM: 500 }]);
+        const stockSampling = sampleLegs(stock);
+        const stockAlt = predictAltitude({
+            route: stock, sampling: stockSampling, terrainM: terrainAlong(stockSampling, () => 300), globalMinM: 60, params
+        }).altM;
+        assert.ok(Math.abs(stockAlt[stockAlt.length - 1] - 500) < 12, `stock leg ends at ${stockAlt[stockAlt.length - 1]}`);
     });
 });
