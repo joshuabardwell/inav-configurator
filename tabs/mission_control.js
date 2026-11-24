@@ -991,7 +991,7 @@ missionControlTab.initialize = function (callback) {
     let $geozoneContent;
     let invalidGeoZones = false;
     let isGeozoneEnabeld = false;
-    let settings = {speed: 0, alt: 5000, safeRadiusSH: 50, fwApproachAlt: 60, fwLandAlt: 5, maxDistSH: 0, fwApproachLength: 0, fwLoiterRadius: 0};
+    const settings = {speed: 0, alt: 5000, safeRadiusSH: 50, fwApproachAlt: 60, fwLandAlt: 5, maxDistSH: 0, fwApproachLength: 0, fwLoiterRadius: 0};
     // Flight path simulation. Everything but the cruise speed comes from the
     // flight controller; the speed is the pilot's estimate, because a fixed wing
     // holds a throttle setting rather than a commanded speed.
@@ -2566,16 +2566,16 @@ function iconKey(filename) {
     //
     /////////////////////////////////////////////
     function loadSettings() {
+        // Read from the FC on every tab entry; the stored copy is only the offline fallback.
+        const fcProvidedSettings = new Set(['fwApproachLength', 'maxDistSH', 'fwLoiterRadius']);
         const missionPlannerSettings = store.get('missionPlannerSettings', false);
         if (missionPlannerSettings) {
-            if (!missionPlannerSettings.fwApproachLength && settings.fwApproachLength) {
-                missionPlannerSettings.fwApproachLength = settings.fwApproachLength;
-                missionPlannerSettings.maxDistSH = settings.maxDistSH;
-                missionPlannerSettings.fwLoiterRadius = settings.fwLoiterRadius;
-            }
-            // Adopt the stored settings first, then save: the other way round wrote the
-            // built-in defaults over them, so they were gone the next time the tab loaded.
-            settings = missionPlannerSettings;
+            Object.keys(missionPlannerSettings).forEach(function (key) {
+                if (!isOffline && fcProvidedSettings.has(key) && Number.isFinite(settings[key])) {
+                    return;
+                }
+                settings[key] = missionPlannerSettings[key];
+            });
             saveSettings();
         }
         refreshSettings();
