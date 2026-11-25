@@ -337,13 +337,18 @@ function respond(altM, targetM, seconds, p, maxDescentMs = p.climbRateMs) {
  *              otherwise lag behind its rise
  *   descent    on a terrain leg no faster than the climb the look-ahead plans with
  *   data lost  never below the last terrain target, still following a higher stock line
+ *   the turn   with turns (mission_turn.js, turnGround(): the highest ground each turn's
+ *              sweep may cross): a terrain leg's look-ahead sees that ground at its
+ *              waypoint, and a stock leg after a terrain leg keeps that leg's floor until
+ *              the aircraft is on course for it (the turn guard). Without turns the turn is
+ *              the corner of the two legs, as before
  *
  * Not modelled: the scan across the width of a turn and the weaker climb in it (the
  * planner scans along the route), the cycles a new leg waits for its own answers,
  * during which the firmware's line does not come down, and the ground speed, which
  * the firmware's scan takes smoothed over 10 s and the planner as one fixed value.
  */
-export function predictAltitude({ route, sampling, terrainM, globalMinM, params = {}, ignoreModes = false }) {
+export function predictAltitude({ route, sampling, terrainM, globalMinM, params = {}, ignoreModes = false, turns = null }) {
     const p = { ...TerrainDefaults, ...params };
     const { samples, legs } = sampling;
     const altM = new Array(samples.length).fill(null);
@@ -403,6 +408,24 @@ export function predictAltitude({ route, sampling, terrainM, globalMinM, params 
                 out.lineValid = true;
             }
         }
+        // The turn at the end of the leg crosses ground the legs do not. The firmware scans
+        // it; here its highest ground stands where the turn begins (backM before the
+        // waypoint), with this leg's minimum as a floor (never a follow leg's clearance)
+        const turn = turns && turns[i];
+        if (turn && turn.groundM !== null && turn.groundM !== undefined && i < route.length - 1) {
+            const ahead = Math.max(0, samples[legs[i].lastSample].distM - (turn.backM || 0) - samples[k].distM);
+            if (ahead <= scanM) {
+                const rise = turn.groundM - terrainM[k];
+                out.neededM = Math.max(out.neededM, rise - climbRatio * ahead);
+                if (ahead <= viewM && ahead > 0) {
+                    const lineRise = rise + lineNextExtraM(heldM, legInfo[i].minM, p.recoverMarginM);
+                    const slope = (lineRise - startM) / ahead;
+                    if (!out.lineValid || slope > out.lineSlope) out.lineSlope = slope;
+                    if (!out.lineValid || lineRise > out.lineTopM) out.lineTopM = lineRise;
+                    out.lineValid = true;
+                }
+            }
+        }
         return out;
     }
 
@@ -430,9 +453,19 @@ export function predictAltitude({ route, sampling, terrainM, globalMinM, params 
             lineM = null;
             continue;
         }
+        // The turn guard: a stock leg after a terrain leg keeps that leg's floor until the
+        // aircraft is on course for it, which the turn's sweep puts alongOutM into the leg.
+        // Its ground is the higher of the ground under the leg and the turn's highest
+        let guard = null;
         if (info.mode === TerrainMode.OFF) {
-            lastTerrainTarget = null;
-            lineM = null;
+            const before = legInfo[i - 1];
+            const turn = turns && turns[i - 1];
+            if (turn && before && before.mode !== TerrainMode.OFF && lineM !== null) {
+                guard = { minM: before.minM, untilM: leg.startDistM + turn.alongOutM, groundM: turn.groundM ?? null };
+            } else {
+                lastTerrainTarget = null;
+                lineM = null;
+            }
         }
 
         const startAltM = z;
@@ -443,6 +476,35 @@ export function predictAltitude({ route, sampling, terrainM, globalMinM, params 
             let targetM = stockM;
             let tag = AltitudeReason.PLANNED;
             let maxDescentMs = p.climbRateMs;
+
+            if (guard && sample.distM > guard.untilM) {
+                guard = null;
+                lastTerrainTarget = null;
+                lineM = null;
+            }
+            if (guard) {
+                const own = terrainM[k];
+                const groundM = own === null ? guard.groundM : (guard.groundM === null ? own : Math.max(own, guard.groundM));
+                if (groundM === null) {
+                    if (lastTerrainTarget !== null) targetM = Math.max(stockM, lastTerrainTarget);
+                    tag = AltitudeReason.NO_DATA;
+                } else {
+                    // A floor at minimum + margin over that ground; the line comes down to
+                    // it at the terrain legs' rate and is never under it
+                    const heldAltM = groundM + guard.minM + p.recoverMarginM;
+                    const beforeM = lineM;
+                    lineM = lineAdvanceM(lineM, lineRate, seconds, heldAltM, plannedClimbMs, heldAltM, false, 0);
+                    lineRise = lineRiseMs(lineRise, beforeM, lineM, seconds, p.climbRateMs, p.lineRiseTauS);
+                    lineRate = lineRateMs(true, -1, 0, lineM - heldAltM, true, plannedClimbMs, p.climbRateMs, p.lineSettleS);
+                    const terrainTargetM = lineTargetM(lineM, lineRise, p.altResponse);
+                    lastTerrainTarget = terrainTargetM;
+                    maxDescentMs = plannedClimbMs;
+                    if (terrainTargetM > stockM) {
+                        targetM = terrainTargetM;
+                        tag = AltitudeReason.TERRAIN_CLIMB;
+                    }
+                }
+            }
 
             if (info.mode !== TerrainMode.OFF) {
                 const groundM = terrainM[k];
@@ -532,12 +594,18 @@ function runsOf(flags, samples) {
  *   belowRanges        [{ legIndex, fromSample, toSample }] where the prediction is below the minimum
  *   fallbackRanges     the same for the stock line on legs that rely on a terrain mode
  *   legs[i]            { index, mode, minM, lowestClearanceM, lowestAtSample, below, fallbackBelow, known, noData }
- *   waypoints[i]       { index, clearanceM, minM, low, legLow, flagged }: low = the waypoint's own
- *                      altitude is under its minimum; legLow = the leg flown to it dips under it
+ *   waypoints[i]       { index, clearanceM, minM, low, legLow, turnLow, flagged }: low = the waypoint's
+ *                      own altitude is under its minimum; legLow = the leg flown to it dips under
+ *                      it; turnLow = the turn at it does
+ *   turns[i]           with turns (mission_turn.js, turnGround()), per waypoint null or
+ *                      { index, groundM, position, altM, clearanceM, stockClearanceM, minM, low,
+ *                      fallbackLow }: the highest ground the turn may cross against the lowest
+ *                      altitude through the turn; low = under the minimum of the leg flown to the
+ *                      waypoint; fallbackLow = only that leg's terrain mode keeps it clear
  */
-export function analyseClearance({ route, sampling, terrainM, globalMinM, params = {} }) {
+export function analyseClearance({ route, sampling, terrainM, globalMinM, params = {}, turns = null }) {
     const { samples, legs } = sampling;
-    const predicted = predictAltitude({ route, sampling, terrainM, globalMinM, params });
+    const predicted = predictAltitude({ route, sampling, terrainM, globalMinM, params, turns });
     const stock = predictAltitude({ route, sampling, terrainM, globalMinM, params, ignoreModes: true });
 
     // A landing descends to the ground on purpose: its leg has no minimum to hold.
@@ -590,12 +658,44 @@ export function analyseClearance({ route, sampling, terrainM, globalMinM, params
     });
 
     const waypointSample = route.map((_, i) => (i === 0 ? 0 : legs[i].lastSample));
+
+    // Each turn against the highest ground its sweep may cross: the lowest altitude the
+    // aircraft has from the turn's start to where it is on course again
+    const turnResults = route.map((_, i) => {
+        const turn = turns && turns[i];
+        if (!turn || turn.groundM === null || turn.groundM === undefined || i === 0) return null;
+        const cornerM = samples[waypointSample[i]].distM;
+        let lowestM = null;
+        let stockLowestM = null;
+        for (let k = 0; k < samples.length; k++) {
+            if (samples[k].distM < cornerM - (turn.backM || 0) || samples[k].distM > cornerM + turn.alongOutM) continue;
+            if (predicted.altM[k] !== null && (lowestM === null || predicted.altM[k] < lowestM)) lowestM = predicted.altM[k];
+            if (stock.altM[k] !== null && (stockLowestM === null || stock.altM[k] < stockLowestM)) stockLowestM = stock.altM[k];
+        }
+        const turnClearanceM = lowestM === null ? null : lowestM - turn.groundM;
+        const stockClearanceM = stockLowestM === null ? null : stockLowestM - turn.groundM;
+        const low = turnClearanceM !== null && turnClearanceM < ownMinM[i];
+        const guarded = predicted.legs[i].mode !== TerrainMode.OFF;
+        return {
+            index: i,
+            groundM: turn.groundM,
+            position: turn.position,
+            altM: lowestM,
+            clearanceM: turnClearanceM,
+            stockClearanceM,
+            minM: ownMinM[i],
+            low,
+            fallbackLow: !low && guarded && stockClearanceM !== null && stockClearanceM < ownMinM[i]
+        };
+    });
+
     const waypoints = route.map((wp, i) => {
         const groundM = samples.length ? terrainM[waypointSample[i]] : null;
         const ownClearanceM = wp.altAmslM === null || groundM === null || groundM === undefined ? null : wp.altAmslM - groundM;
         const low = ownClearanceM !== null && ownClearanceM < ownMinM[i];
         const legLow = i > 0 && legSummaries[i].below;
-        return { index: i, clearanceM: ownClearanceM, minM: ownMinM[i], low, legLow, flagged: low || legLow };
+        const turnLow = Boolean(turnResults[i] && turnResults[i].low);
+        return { index: i, clearanceM: ownClearanceM, minM: ownMinM[i], low, legLow, turnLow, flagged: low || legLow || turnLow };
     });
 
     return {
@@ -607,6 +707,7 @@ export function analyseClearance({ route, sampling, terrainM, globalMinM, params
         belowRanges,
         fallbackRanges,
         legs: legSummaries,
-        waypoints
+        waypoints,
+        turns: turnResults
     };
 }

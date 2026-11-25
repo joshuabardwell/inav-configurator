@@ -52,6 +52,7 @@ import VectorLayer from 'ol/layer/Vector.js';
 import { LineString } from 'ol/geom';
 import Stroke from 'ol/style/Stroke';
 import RegularShape from 'ol/style/RegularShape';
+import CircleStyle from 'ol/style/Circle';
 import Circle from 'ol/geom/Circle';
 import PointerInteraction from 'ol/interaction/Pointer.js';
 import Draw from 'ol/interaction/Draw.js';
@@ -95,6 +96,7 @@ import {
     analyseClearance, clearTerrainBits, legMinM, legMinOverrideM, sampleLegs, supportsTerrainOptions,
     terrainModeOfP3, withLegMin, withTerrainMode
 } from './../js/mission_terrain.js';
+import { TurnMode, routeTurnSweeps, turnGround } from './../js/mission_turn.js';
 import { queryTerrainHeights, queryTerrainStatus } from './../js/terrainMsp';
 import { fromDisplayUnits, getUnitDisplayName, getUnitMultiplier, toDisplayUnits, toFieldText } from './../js/unitConversion';
 import {
@@ -1010,6 +1012,7 @@ missionControlTab.initialize = function (callback) {
         globalMinM: MIN_AGL_DEFAULT_M,
         minFromFc: false,
         params: {},         // TerrainDefaults overrides read from the flight controller
+        turn: {},           // TurnDefaults overrides read from the flight controller (how it turns at a waypoint)
         analysis: null,     // result of the last run, see runTerrainAnalysis()
         layer: null,
         sequence: 0,
@@ -1481,6 +1484,31 @@ missionControlTab.initialize = function (callback) {
                 mspHelper.getSetting("nav_fw_alt_control_response").then((data) => {
                     const response = data ? readNumericSetting(data, 0) : 0;
                     if (response > 0) terrain.params.altResponse = response / 100;
+                }).catch(() => {}).then(() => callback());
+            },
+            // How the aircraft turns at a waypoint: the planner looks at the ground each
+            // turn sweeps. A firmware without one of these keeps the firmware default.
+            function (callback) {
+                mspHelper.getSetting("nav_fw_wp_turn_mode").then((data) => {
+                    const name = data ? String(data.setting?.table?.values?.[data.value] ?? '').toUpperCase() : '';
+                    if (name in TurnMode) terrain.turn.turnMode = TurnMode[name];
+                }).catch(() => {}).then(() => callback());
+            },
+            function (callback) {
+                mspHelper.getSetting("nav_fw_wp_tracking_accuracy").then((data) => {
+                    if (data) terrain.turn.tracking = readNumericSetting(data, 0) > 0;
+                }).catch(() => {}).then(() => callback());
+            },
+            function (callback) {
+                mspHelper.getSetting("nav_fw_wp_tracking_max_angle").then((data) => {
+                    const degrees = data ? readNumericSetting(data, 0) : 0;
+                    if (degrees > 0) terrain.turn.trackMaxAngleDeg = degrees;
+                }).catch(() => {}).then(() => callback());
+            },
+            function (callback) {
+                mspHelper.getSetting("nav_fw_wp_turn_max_lead_time").then((data) => {
+                    const milliseconds = data ? readNumericSetting(data, 0) : 0;
+                    if (milliseconds > 0) terrain.turn.maxLeadMs = milliseconds;
                 }).catch(() => {}).then(() => callback());
             },
             // How many terrain blocks the board caches limits how far its look-ahead
@@ -2693,6 +2721,31 @@ function iconKey(filename) {
         return {...terrain.params, speedMs: simulation.speedMs};
     }
 
+    /* How the flight controller turns at a waypoint, for the sweep of each turn: its own
+       settings where it gave them, with the bank and the waypoint radius the simulation
+       already reads (the tighter of nav_fw_bank_angle and max_angle_inclination_rll). */
+    function turnSettings() {
+        const ceilingBinds = simulation.bankCeilingDeg > 0 && simulation.bankCeilingDeg < simulation.bankAngleDeg;
+        return {
+            ...terrain.turn,
+            bankDeg: ceilingBinds ? simulation.bankCeilingDeg : simulation.bankAngleDeg,
+            wpRadiusM: simulation.wpRadiusCm / 100
+        };
+    }
+
+    /* The highest ground each turn of the route may cross. Only the terrain folder
+       answers: the sweep's points are not in path order, which the online source's
+       thinning needs, and the card holds the same files. */
+    async function turnGroundOf(route) {
+        const turns = routeTurnSweeps(route, simulation.speedMs, turnSettings());
+        const ground = await Promise.all(turns.map(async (turn) => {
+            if (!turn) return null;
+            const results = await getElevations(turn.positions, {online: false});
+            return results.map(result => result.elevation);
+        }));
+        return turnGround(turns, ground);
+    }
+
     /* The offline copy of the default minimum lives with the planner settings. A
        connected flight controller that has terrain_nav_min_agl overrides it. */
     function loadDefaultMinAgl() {
@@ -2785,8 +2838,9 @@ function iconKey(filename) {
                 const sampling = sampleLegs(route);
                 const results = await getElevations(sampling.samples);
                 const terrainM = results.map(result => result.elevation);
+                const turns = await turnGroundOf(route);
                 analysis = {
-                    ...analyseClearance({route, sampling, terrainM, globalMinM: terrain.globalMinM, params: terrainParams()}),
+                    ...analyseClearance({route, sampling, terrainM, globalMinM: terrain.globalMinM, params: terrainParams(), turns}),
                     route,
                     sampling,
                     terrainM,
@@ -2867,6 +2921,22 @@ function iconKey(filename) {
             features.push(feature);
         });
 
+        // Where a turn is low: a ring on the highest ground it may cross, red when nothing
+        // keeps the aircraft off it, amber when only the terrain leg's floor does
+        (analysis.turns || []).forEach((turn) => {
+            if (!turn || !turn.position || !(turn.low || turn.fallbackLow)) return;
+            const feature = new Feature({geometry: new Point(fromLonLat([turn.position.lon, turn.position.lat]))});
+            const color = turn.low ? TERRAIN_BELOW_COLOR : TERRAIN_FALLBACK_COLOR;
+            feature.setStyle(new Style({
+                image: new CircleStyle({
+                    radius: 9,
+                    fill: new Fill({color: 'rgba(255, 255, 255, 0.35)'}),
+                    stroke: new Stroke({color, width: 3})
+                })
+            }));
+            features.push(feature);
+        });
+
         if (!features.length) return;
         terrain.layer = new VectorLayer({source: new VectorSource({features}), zIndex: 120});
         // Same rule as the simulated track: an overlay must never be picked up as a
@@ -2896,6 +2966,14 @@ function iconKey(filename) {
             $text.text(i18n.getMessage('missionLegClearance',
                 [String(Math.round(leg.lowestClearanceM)), String(Math.max(0, Math.round(beforeM)))]));
             $text.css('color', leg.below ? '#FF0000' : '');
+        }
+        // The turn at this waypoint, when it crosses ground the legs do not
+        const turn = (analysis.turns || [])[index];
+        if (turn && (turn.low || turn.fallbackLow)) {
+            const key = turn.low ? 'missionTurnClearanceLow' : 'missionTurnClearanceFloor';
+            const metres = Math.round(turn.low ? turn.clearanceM : turn.stockClearanceM);
+            $text.text($text.text() + ' ' + i18n.getMessage(key, [String(metres), String(Math.round(turn.minM))]));
+            if (turn.low) $text.css('color', '#FF0000');
         }
         $row.show();
     }

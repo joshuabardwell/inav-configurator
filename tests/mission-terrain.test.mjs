@@ -536,3 +536,69 @@ describe('terrain target and the altitude controller', () => {
         assert.ok(Math.abs(stockAlt[stockAlt.length - 1] - 500) < 12, `stock leg ends at ${stockAlt[stockAlt.length - 1]}`);
     });
 });
+
+describe('the turn at a waypoint', () => {
+    // Flat ground at 400 m under the legs; the turn at the middle waypoint may cross ground
+    // at 460 m (mission_turn.js finds it; here it is given). Every altitude is 70 m over the
+    // flat: the floor of a 60 m minimum exactly.
+    const flat = () => 400;
+    const turnAt = (route, groundM) => [null, { index: 1, groundM, position: { lat: route[1].lat, lon: route[1].lon + 0.002 }, reachM: 300, backM: 0, alongOutM: 300 }, null];
+    const routeWith = (p3) => northRoute([
+        { atM: 0, altAmslM: 470 },
+        { atM: 2000, altAmslM: 470, p3 },
+        { atM: 4000, altAmslM: 470 }
+    ]);
+    const sampleAt = (sampling, distM) => sampling.samples.findIndex(sample => sample.distM >= distM);
+
+    test('a floor leg climbs for the ground its turn crosses and keeps the floor until it is on course', () => {
+        const route = routeWith(p3With(TerrainMode.FLOOR));
+        const sampling = sampleLegs(route);
+        const terrainM = terrainAlong(sampling, flat);
+        const analysis = analyseClearance({ route, sampling, terrainM, globalMinM: 60, turns: turnAt(route, 460) });
+        const corner = sampling.legs[1].lastSample;
+        assert.ok(analysis.altM[corner] >= 460 + 60, `at the waypoint ${analysis.altM[corner]}`);
+        assert.ok(analysis.altM[sampleAt(sampling, 2150)] >= 460 + 60, 'through the guard');
+        assert.ok(Math.abs(analysis.altM[sampleAt(sampling, 3800)] - 470) < 3, 'then back on the stock line');
+        assert.equal(analysis.turns[1].low, false);
+        assert.equal(analysis.turns[1].fallbackLow, true, 'without terrain data the stock line is 10 m over it');
+        assert.ok(Math.abs(analysis.turns[1].stockClearanceM - 10) < 0.5);
+        assert.equal(analysis.waypoints[1].turnLow, false);
+        assert.equal(analysis.turns[0], null);
+        assert.equal(analysis.turns[2], null);
+    });
+
+    test('a stock leg does not: the turn is flagged at its waypoint', () => {
+        const route = routeWith(0);
+        const sampling = sampleLegs(route);
+        const terrainM = terrainAlong(sampling, flat);
+        const analysis = analyseClearance({ route, sampling, terrainM, globalMinM: 60, turns: turnAt(route, 460) });
+        assert.ok(Math.abs(analysis.altM[sampling.legs[1].lastSample] - 470) < 0.5);
+        assert.equal(analysis.turns[1].low, true);
+        assert.equal(analysis.turns[1].fallbackLow, false);
+        assert.ok(Math.abs(analysis.turns[1].clearanceM - 10) < 0.5);
+        assert.equal(analysis.waypoints[1].turnLow, true);
+        assert.equal(analysis.waypoints[1].flagged, true);
+        assert.equal(analysis.waypoints[1].legLow, false, 'the legs themselves are clear');
+    });
+
+    test('a turn over ground no higher than the legs changes nothing', () => {
+        const route = routeWith(p3With(TerrainMode.FLOOR));
+        const sampling = sampleLegs(route);
+        const terrainM = terrainAlong(sampling, flat);
+        const plain = analyseClearance({ route, sampling, terrainM, globalMinM: 60 });
+        const withTurn = analyseClearance({ route, sampling, terrainM, globalMinM: 60, turns: turnAt(route, 400) });
+        plain.altM.forEach((altitude, k) => assert.ok(Math.abs(altitude - withTurn.altM[k]) < 0.05, `sample ${k}`));
+        assert.equal(withTurn.turns[1].low, false);
+        assert.equal(withTurn.turns[1].fallbackLow, false);
+        assert.deepEqual(plain.turns, [null, null, null]);
+    });
+
+    test('a turn whose ground is not known is left out', () => {
+        const route = routeWith(0);
+        const sampling = sampleLegs(route);
+        const terrainM = terrainAlong(sampling, flat);
+        const analysis = analyseClearance({ route, sampling, terrainM, globalMinM: 60, turns: turnAt(route, null) });
+        assert.equal(analysis.turns[1], null);
+        assert.equal(analysis.waypoints[1].flagged, false);
+    });
+});
