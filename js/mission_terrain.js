@@ -181,8 +181,9 @@ export const TerrainDefaults = Object.freeze({
     plannedClimbFraction: 0.5,  // TERRAIN_NAV_HOLD_PLANNED_CLIMB_FRACTION: the look-ahead plans with half of it,
                                 // and a terrain leg descends no faster than that
     altResponse: 0.4,           // nav_fw_alt_control_response (40): climb rate = 0.4 x altitude error
-    leadFadeM: 10,              // TERRAIN_NAV_MISSION_LEAD_FADE_CM: the planned-climb lead is full from here
-    riseWindowS: 1,             // the measured lead: the ground's rise over the last second
+    viewS: 20,                  // TERRAIN_NAV_MISSION_VIEW_S: how far ahead the line a terrain leg flies looks
+    lineRiseTauS: 1,            // TERRAIN_NAV_MISSION_LINE_RISE_TAU_S: the lead follows the line's rise smoothed
+    lineSettleS: 5,             // TERRAIN_NAV_MISSION_LINE_SETTLE_S: the last metres of the line's way down are eased
     lookaheadM: 1000,           // terrain_nav_lookahead
     cacheBlocks: 8,             // terrain block cache: 8 on boards with 512 kB RAM or more, else 4
     recoverMarginM: 10,         // TERRAIN_NAV_HOLD_RECOVER_MARGIN_CM: the hold keeps minimum + 10 m
@@ -242,25 +243,51 @@ export function climbLineM(groundM, minM, marginM, climbNeededM) {
     return groundM + minM + marginM + climbNeededM;
 }
 
-/* Lead while the look-ahead asks for a climb: the lag of the planned climb rate, faded in. */
-export function plannedLeadM(climbNeededM, plannedClimbMs, altResponse, fadeM = TerrainDefaults.leadFadeM) {
-    const fade = Math.min(1, climbNeededM / fadeM);
-    return fade > 0 ? fade * lagM(plannedClimbMs, altResponse) : 0;
+/* Extra rise the line's look-ahead adds past the next waypoint: the line is aimed over the
+   ground at the height this leg holds, and past the waypoint at the next leg's minimum +
+   margin (the next leg's own held height is not known before it starts). */
+export function lineNextExtraM(heldM, nextMinM, marginM) {
+    return nextMinM + marginM - heldM;
 }
 
-/* Lead for the rate the ground under the aircraft rose at: only a rise, and no faster
-   than the altitude controller may command a climb. */
-export function measuredLeadM(riseRateMs, maxClimbMs, altResponse) {
-    return riseRateMs > 0 ? lagM(Math.min(riseRateMs, maxClimbMs), altResponse) : 0;
+/* The rate the line a terrain leg flies moves at. slope: height per distance flown that the
+   steepest point in view needs: up, the line is aimed at that point. Negative: every point
+   is lower, and the line comes down toward the highest of them (dropM below it) at
+   maxDescentMs at most, eased over the last metres. Without an answer the line stays level;
+   a leg that may not come down yet (a point in view without data) only goes up. */
+export function lineRateMs(slopeValid, slope, speedMs, dropM, mayDescend, maxDescentMs, maxClimbMs,
+    settleS = TerrainDefaults.lineSettleS) {
+    if (!slopeValid) return 0;
+    if (!(slope < 0)) return Math.min(slope * speedMs, maxClimbMs);
+    if (!mayDescend || !(dropM > 0)) return 0;
+    return -Math.min(dropM / settleS, maxDescentMs);
 }
 
-/* The terrain target with its leads: the higher of the held height with the measured
-   lead and, while the look-ahead asks for a climb, the climb line with the planned-climb
-   lead. heldAltM: the ground + the height above it the leg holds. The climb line gets
-   no measured lead: it moves in steps, and the lead would put 2.5 times each on top. */
-export function leadTargetM(heldAltM, climbing, lineM, plannedLead, measuredLead) {
-    const targetM = heldAltM + measuredLead;
-    return climbing && lineM + plannedLead > targetM ? lineM + plannedLead : targetM;
+/* The line after seconds at rateMs, kept on or above what it may never be under:
+   heldAltM (ground + the height the leg holds; from below it the line also rises at
+   approachMs, up to it), hardFloorM (ground + minimum + margin) and, while the look-ahead
+   asks for a climb, its climb line. */
+export function lineAdvanceM(lineM, rateMs, seconds, heldAltM, approachMs, hardFloorM, climbing, climbLineAltM) {
+    let z = lineM + rateMs * seconds;
+    if (z < heldAltM) z = Math.min(heldAltM, z + approachMs * seconds);
+    if (z < hardFloorM) z = hardFloorM;
+    if (climbing && z < climbLineAltM) z = climbLineAltM;
+    return z;
+}
+
+/* The line's rise, smoothed, after it moved from fromM to toM in seconds. Only a rise
+   counts, and no faster than the altitude controller may command a climb. */
+export function lineRiseMs(riseMs, fromM, toM, seconds, maxClimbMs, tauS = TerrainDefaults.lineRiseTauS) {
+    if (!(seconds > 0)) return riseMs;
+    let rate = (toM - fromM) / seconds;
+    if (rate > maxClimbMs) rate = maxClimbMs;
+    else if (!(rate > 0)) rate = 0;
+    return riseMs + (rate - riseMs) * seconds / (tauS + seconds);
+}
+
+/* The terrain target: the line raised by the lag of its rise. */
+export function lineTargetM(lineM, riseMs, altResponse) {
+    return lineM + lagM(riseMs > 0 ? riseMs : 0, altResponse);
 }
 
 /* The target no lower than the altitude controller answers with a descent of maxDescentMs. */
@@ -297,20 +324,24 @@ function respond(altM, targetM, seconds, p, maxDescentMs = p.climbRateMs) {
  * Mirrors the firmware:
  *   stock      linear from the altitude at the start of the leg to the waypoint
  *              altitude, reached with a tenth of the leg left
- *   floor      the higher of the stock line and (ground + minimum + 10 m), raised
- *              early for higher ground or a higher minimum ahead along the route
- *   follow     ground + the waypoint's own clearance (never less than minimum + 10 m),
- *              with the same early raise
- *   leads      the terrain target is raised by what the altitude controller would
- *              otherwise lag behind it: the climb line while the look-ahead asks for
- *              a climb, the held height while the ground under the aircraft rises
+ *   the line   a terrain leg flies a line over the ground ahead, not the ground's
+ *              contour: up, aimed at the point in view (viewS of flight) that needs
+ *              the steepest line; down only when every point in view is lower, to the
+ *              highest of them; never under ground + minimum + 10 m nor under the
+ *              look-ahead's climb line
+ *   floor      the higher of the stock line and that line, held at minimum + 10 m
+ *   follow     that line, held at the waypoint's own clearance at least (never less
+ *              than minimum + 10 m): the aircraft comes down with the terrain after an
+ *              obstacle, and stays up over a dip shorter than the view
+ *   lead       the target is the line raised by what the altitude controller would
+ *              otherwise lag behind its rise
  *   descent    on a terrain leg no faster than the climb the look-ahead plans with
  *   data lost  never below the last terrain target, still following a higher stock line
  *
- * Not modelled: the scan across the width of a turn (the planner scans along the
- * route), the cycles a new leg waits for its own answers, during which the
- * firmware keeps the target of the leg before, and the ground speed, which the
- * firmware's scan takes smoothed over 10 s and the planner as one fixed value.
+ * Not modelled: the scan across the width of a turn and the weaker climb in it (the
+ * planner scans along the route), the cycles a new leg waits for its own answers,
+ * during which the firmware's line does not come down, and the ground speed, which
+ * the firmware's scan takes smoothed over 10 s and the planner as one fixed value.
  */
 export function predictAltitude({ route, sampling, terrainM, globalMinM, params = {}, ignoreModes = false }) {
     const p = { ...TerrainDefaults, ...params };
@@ -332,28 +363,47 @@ export function predictAltitude({ route, sampling, terrainM, globalMinM, params 
 
     const scanM = lookaheadDistanceM(p);
     const plannedClimbMs = p.plannedClimbFraction * p.climbRateMs;
-    const climbRatio = plannedClimbMs / Math.max(p.speedMs, p.minSlopeSpeedMs);
+    const slopeSpeedMs = Math.max(p.speedMs, p.minSlopeSpeedMs);
+    const climbRatio = plannedClimbMs / slopeSpeedMs;
+    const viewM = Math.min(scanM, slopeSpeedMs * p.viewS);
 
-    // Worst shortfall ahead along the route: how much the ground (plus any rise in
-    // the minimum past the next waypoint) outruns a climb at the planned rate.
-    function climbNeededAhead(k, i) {
-        if (scanM <= 0 || terrainM[k] === null) return 0;
+    // The route look-ahead from sample k of leg i, as the firmware's scan answers it:
+    //   neededM     worst shortfall ahead: how much the ground (plus any rise in the
+    //               minimum past the next waypoint) outruns a climb at the planned rate
+    //   lineSlope   the steepest line a point within the view needs from the line's
+    //               height over the held height (lineStartM, not below 0); lineTopM:
+    //               the highest ground in view, above the ground here; lineMissed: a
+    //               point in view has no data
+    function lookAhead(k, i, lineStartM, heldM) {
+        const out = { neededM: 0, lineValid: false, lineMissed: false, lineSlope: 0, lineTopM: 0 };
+        if (scanM <= 0 || terrainM[k] === null) return out;
         const next = legInfo[i + 1];
         const lastLeg = next && next.mode !== TerrainMode.OFF ? i + 1 : i;
-        let worst = 0;
+        const startM = Math.max(0, lineStartM);
         for (let n = k + 1; n < samples.length && samples[n].legIndex <= lastLeg; n++) {
             const ahead = samples[n].distM - samples[k].distM;
             if (ahead > scanM) break;
-            if (terrainM[n] === null) continue;
-            let rise = terrainM[n] - terrainM[k];
-            if (samples[n].legIndex === i + 1) {
-                // Past the turn the next leg's minimum applies. The climb line aims at
-                // minimum + margin on either leg.
-                rise += turnExtraRiseM(legInfo[i].minM, next.minM);
+            const inView = ahead <= viewM;
+            if (terrainM[n] === null) {
+                if (inView) out.lineMissed = true;
+                continue;
             }
-            worst = Math.max(worst, rise - climbRatio * ahead);
+            const rise = terrainM[n] - terrainM[k];
+            // Past the turn the next leg's minimum applies. The climb line aims at
+            // minimum + margin on either leg; the line at this leg's held height, then
+            // at the next leg's minimum + margin.
+            const past = samples[n].legIndex === i + 1;
+            out.neededM = Math.max(out.neededM,
+                rise + (past ? turnExtraRiseM(legInfo[i].minM, next.minM) : 0) - climbRatio * ahead);
+            if (inView && ahead > 0) {
+                const lineRise = rise + (past ? lineNextExtraM(heldM, next.minM, p.recoverMarginM) : 0);
+                const slope = (lineRise - startM) / ahead;
+                if (!out.lineValid || slope > out.lineSlope) out.lineSlope = slope;
+                if (!out.lineValid || lineRise > out.lineTopM) out.lineTopM = lineRise;
+                out.lineValid = true;
+            }
         }
-        return worst;
+        return out;
     }
 
     let z = route[0].altAmslM;
@@ -361,23 +411,11 @@ export function predictAltitude({ route, sampling, terrainM, globalMinM, params 
     reason[0] = z === null ? AltitudeReason.UNKNOWN : AltitudeReason.PLANNED;
     let lastTerrainTarget = null;
 
-    // The rise of the ground under the aircraft, for the measured lead: the increments
-    // of the last second of flight (always the latest one), newest last. An increment
-    // is taken between two samples that both have ground data.
-    let rises = [];
-    let riseFrom = null;
-    function riseRateMs(groundM, seconds) {
-        if (riseFrom !== null && seconds > 0) {
-            rises.push({ riseM: groundM - riseFrom, seconds });
-            let kept = 0;
-            let first = rises.length;
-            while (first > 0 && kept < p.riseWindowS) kept += rises[--first].seconds;
-            rises = rises.slice(first);
-        }
-        riseFrom = groundM;
-        const total = rises.reduce((sum, r) => sum + r.seconds, 0);
-        return total > 0 ? rises.reduce((sum, r) => sum + r.riseM, 0) / total : 0;
-    }
+    // The line the terrain legs fly: it goes on from one terrain leg to the next and
+    // starts again after a stock leg
+    let lineM = null;
+    let lineRate = 0;
+    let lineRise = 0;
 
     for (let i = 1; i < route.length; i++) {
         const info = legInfo[i];
@@ -389,12 +427,12 @@ export function predictAltitude({ route, sampling, terrainM, globalMinM, params 
             altM[leg.lastSample] = z;
             reason[leg.lastSample] = z === null ? AltitudeReason.UNKNOWN : AltitudeReason.PLANNED;
             lastTerrainTarget = null;
+            lineM = null;
             continue;
         }
         if (info.mode === TerrainMode.OFF) {
             lastTerrainTarget = null;
-            rises = [];
-            riseFrom = null;
+            lineM = null;
         }
 
         const startAltM = z;
@@ -409,18 +447,36 @@ export function predictAltitude({ route, sampling, terrainM, globalMinM, params 
             if (info.mode !== TerrainMode.OFF) {
                 const groundM = terrainM[k];
                 if (groundM === null) {
+                    // The line stands where it is: never descend on no data
                     if (lastTerrainTarget !== null) targetM = Math.max(stockM, lastTerrainTarget);
                     tag = AltitudeReason.NO_DATA;
-                    rises = [];
-                    riseFrom = null;
                 } else {
                     const following = info.mode === TerrainMode.FOLLOW && info.clearanceM !== null;
                     const heldM = heldHeightM(info.mode, info.clearanceM, info.minM, p.recoverMarginM);
-                    const neededM = climbNeededAhead(k, i);
-                    const lineM = climbLineM(groundM, info.minM, p.recoverMarginM, neededM);
-                    const terrainTargetM = leadTargetM(groundM + heldM, neededM > 0, lineM,
-                        plannedLeadM(neededM, plannedClimbMs, p.altResponse, p.leadFadeM),
-                        measuredLeadM(riseRateMs(groundM, seconds), p.climbRateMs, p.altResponse));
+                    const hardFloorM = groundM + info.minM + p.recoverMarginM;
+                    if (lineM === null) {
+                        // The first sample of a run of terrain legs: the line starts at
+                        // the height the leg holds
+                        lineM = groundM + heldM;
+                        lineRate = 0;
+                        lineRise = 0;
+                    }
+                    // As the firmware does it: on at the rate of the sample before, the
+                    // scan from there, what the line may never be under, its rise, and
+                    // the rate until the next sample
+                    const beforeM = lineM;
+                    const scan = lookAhead(k, i, lineM + lineRate * seconds - (groundM + heldM), heldM);
+                    lineM = lineAdvanceM(lineM, lineRate, seconds, groundM + heldM, plannedClimbMs, hardFloorM,
+                        scan.neededM > 0, climbLineM(groundM, info.minM, p.recoverMarginM, scan.neededM));
+                    lineRise = lineRiseMs(lineRise, beforeM, lineM, seconds, p.climbRateMs, p.lineRiseTauS);
+                    // Without a look-ahead there is nothing to aim at, and the only ground
+                    // in view is the ground here: the line comes down to the held height
+                    // and stays on it
+                    lineRate = scanM <= 0
+                        ? lineRateMs(true, -1, 0, lineM - (groundM + heldM), true, plannedClimbMs, p.climbRateMs, p.lineSettleS)
+                        : lineRateMs(scan.lineValid, scan.lineSlope, slopeSpeedMs, lineM - (groundM + heldM + scan.lineTopM),
+                            !scan.lineMissed, plannedClimbMs, p.climbRateMs, p.lineSettleS);
+                    const terrainTargetM = lineTargetM(lineM, lineRise, p.altResponse);
                     lastTerrainTarget = terrainTargetM;
                     maxDescentMs = plannedClimbMs;
                     if (following) {
