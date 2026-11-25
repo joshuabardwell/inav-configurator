@@ -3181,7 +3181,18 @@ function iconKey(filename) {
 
         const samples = analysis.sampling.samples;
         const features = [];
-        const addLine = (range, style) => {
+        const wpNumber = (i) => String(analysis.route[i].number);
+        const metres = (value) => String(Math.round(value));
+        // The lowest clearance in a range, with the minimum at that sample
+        const lowestIn = (range, clearances) => {
+            let at = -1;
+            for (let k = range.fromSample; k <= range.toSample; k++) {
+                if (clearances[k] !== null && (at < 0 || clearances[k] < clearances[at])) at = k;
+            }
+            return at < 0 ? null : {clearanceM: clearances[at], minM: analysis.minM[at]};
+        };
+        // Each warning mark carries the hover text that says what it means
+        const addLine = (range, style, hintKey, clearances) => {
             const coordinates = [];
             for (let k = range.fromSample; k <= range.toSample; k++) {
                 coordinates.push(fromLonLat([samples[k].lon, samples[k].lat]));
@@ -3189,6 +3200,11 @@ function iconKey(filename) {
             if (coordinates.length < 2) return;
             const feature = new Feature({geometry: new LineString(coordinates)});
             feature.setStyle(style);
+            const lowest = lowestIn(range, clearances);
+            if (lowest) {
+                feature.set('terrain_hint', i18n.getMessage(hintKey,
+                    [wpNumber(range.legIndex), metres(lowest.clearanceM), metres(lowest.minM)]));
+            }
             features.push(feature);
         };
 
@@ -3199,8 +3215,10 @@ function iconKey(filename) {
             new Style({stroke: new Stroke({color: '#ffffff', width: 9})}),
             new Style({stroke: new Stroke({color: TERRAIN_BELOW_COLOR, width: 6})})
         ];
-        analysis.fallbackRanges.forEach(range => addLine(range, fallbackStyle));
-        analysis.belowRanges.forEach(range => addLine(range, belowStyle));
+        analysis.fallbackRanges.forEach(range => addLine(range, fallbackStyle,
+            'missionTerrainTipFallback', analysis.stockClearanceM || []));
+        analysis.belowRanges.forEach(range => addLine(range, belowStyle,
+            'missionTerrainTipBelow', analysis.clearanceM));
 
         const badged = new Set();
         analysis.waypoints.forEach((entry, i) => {
@@ -3209,6 +3227,12 @@ function iconKey(filename) {
             badged.add(point.number);
             const feature = new Feature({geometry: new Point(fromLonLat([point.lon, point.lat]))});
             feature.setStyle(terrainBadgeStyle());
+            const lines = [i18n.getMessage('missionTerrainTipWaypoint', [wpNumber(i)])];
+            if (entry.low) lines.push(i18n.getMessage('missionTerrainTipWaypointLow', [metres(entry.clearanceM), metres(entry.minM)]));
+            if (entry.legLow) lines.push(i18n.getMessage('missionTerrainTipWaypointLeg'));
+            if (entry.turnLow) lines.push(i18n.getMessage('missionTerrainTipWaypointTurn'));
+            lines.push(i18n.getMessage('missionTerrainTipSelect'));
+            feature.set('terrain_hint', lines.join(' '));
             features.push(feature);
         });
 
@@ -3225,6 +3249,9 @@ function iconKey(filename) {
                     stroke: new Stroke({color, width: 3})
                 })
             }));
+            feature.set('terrain_hint', turn.low
+                ? i18n.getMessage('missionTerrainTipTurnLow', [wpNumber(turn.index), metres(turn.clearanceM), metres(turn.minM)])
+                : i18n.getMessage('missionTerrainTipTurnFloor', [wpNumber(turn.index), metres(turn.stockClearanceM), metres(turn.minM)]));
             features.push(feature);
         });
 
@@ -6411,6 +6438,45 @@ function iconKey(filename) {
         });
         map.addOverlay(addWpOverlay);
 
+        // Hover text on the terrain warning marks (badge, ring, red and amber lines):
+        // each feature carries its own 'terrain_hint'
+        const terrainTipEl = document.createElement('div');
+        terrainTipEl.className = 'terrain-warning-tooltip';
+        Object.assign(terrainTipEl.style, {
+            background: 'rgba(0,0,0,0.8)',
+            color: '#fff',
+            padding: '4px 8px',
+            borderRadius: '4px',
+            fontSize: '0.85em',
+            fontFamily: 'sans-serif',
+            maxWidth: '22em',
+            whiteSpace: 'normal',
+            pointerEvents: 'none',
+            boxShadow: '0 1px 4px rgba(0,0,0,0.3)',
+            display: 'none',
+        });
+        const terrainTipOverlay = new Overlay({
+            element: terrainTipEl,
+            offset: [14, 14],
+            positioning: 'top-left',
+            stopEvent: false,
+        });
+        map.addOverlay(terrainTipOverlay);
+        const showTerrainTip = function (pixel, coordinate) {
+            const layer = terrain.layer;
+            const hint = layer && pixel ? map.forEachFeatureAtPixel(pixel,
+                (feature) => feature.get('terrain_hint') || undefined,
+                {layerFilter: (candidate) => candidate === layer, hitTolerance: 4}) : undefined;
+            if (hint) {
+                terrainTipEl.textContent = hint;
+                terrainTipEl.style.display = '';
+                terrainTipOverlay.setPosition(coordinate);
+            } else {
+                terrainTipEl.style.display = 'none';
+            }
+        };
+        map.getViewport().addEventListener('mouseleave', () => { terrainTipEl.style.display = 'none'; });
+
         //////////////////////////////////////////////////////////////////////////
         // save map view settings when user moves it
         //////////////////////////////////////////////////////////////////////////
@@ -6497,16 +6563,28 @@ function iconKey(filename) {
         // Hit-testing reads pixels back from the canvas, which is expensive and floods
         // the console with Chrome's readback warning when done on every mouse move, so
         // both hover handlers are held to a few checks per second.
+        // The last move inside the wait is still checked once the wait is over, so a
+        // tooltip never stays up after the cursor has left its mark.
         let lastHoverInfoAt = 0;
-        map.on('pointermove', function(evt) {
-            if (evt.dragging) {
-                return;
-            }
-            const now = Date.now();
-            if (now - lastHoverInfoAt < 150) return;
-            lastHoverInfoAt = now;
+        let pendingHover = null;
+        const hoverCheck = function(evt) {
+            lastHoverInfoAt = Date.now();
             const pixel = map.getEventPixel(evt.originalEvent);
             displayFeatureInfo(pixel);
+            showTerrainTip(pixel, evt.coordinate);
+        };
+        map.on('pointermove', function(evt) {
+            if (evt.dragging) {
+                terrainTipEl.style.display = 'none';
+                return;
+            }
+            clearTimeout(pendingHover);
+            const wait = 150 - (Date.now() - lastHoverInfoAt);
+            if (wait > 0) {
+                pendingHover = setTimeout(() => hoverCheck(evt), wait);
+                return;
+            }
+            hoverCheck(evt);
         });
 
         //////////////////////////////////////////////////////////////////////////

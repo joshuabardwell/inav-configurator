@@ -591,6 +591,7 @@ function runsOf(flags, samples) {
  *                      a sample closer to the ground than its leg's minimum is BELOW_MIN
  *   stockAltM          the altitude per sample on stock firmware (terrain options ignored)
  *   clearanceM, minM   predicted clearance and the applicable minimum per sample
+ *   stockClearanceM    the clearance per sample on stock firmware
  *   belowRanges        [{ legIndex, fromSample, toSample }] where the prediction is below the minimum
  *   fallbackRanges     the same for the stock line on legs that rely on a terrain mode
  *   legs[i]            { index, mode, minM, lowestClearanceM, lowestAtSample, below, fallbackBelow, known, noData }
@@ -703,6 +704,7 @@ export function analyseClearance({ route, sampling, terrainM, globalMinM, params
         stockAltM: stock.altM,
         reason,
         clearanceM,
+        stockClearanceM,
         minM,
         belowRanges,
         fallbackRanges,
