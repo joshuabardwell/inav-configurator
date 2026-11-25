@@ -5856,6 +5856,12 @@
     "missionLegClearance": {
         "message": "Leg to this point: lowest ground distance $1 m, $2 m before it."
     },
+    "missionTurnClearanceLow": {
+        "message": "The turn at this point crosses higher ground than the legs do: $1 m over it, under the $2 m minimum."
+    },
+    "missionTurnClearanceFloor": {
+        "message": "The turn at this point crosses higher ground than the legs do. The terrain leg's floor keeps it clear; without terrain data on the card it would be $1 m over it, under the $2 m minimum."
+    },
     "missionLegClearanceUnknown": {
         "message": "Leg to this point: ground distance not known (no terrain data, or an altitude relative to home without a home position)."
     },
