@@ -13,13 +13,15 @@ import {
     climbLineM,
     heldHeightM,
     lagM,
-    leadTargetM,
     legMinM,
     legMinOverrideM,
     limitDescentM,
+    lineAdvanceM,
+    lineNextExtraM,
+    lineRateMs,
+    lineRiseMs,
+    lineTargetM,
     lookaheadDistanceM,
-    measuredLeadM,
-    plannedLeadM,
     predictAltitude,
     sampleLegs,
     samplePathEvenly,
@@ -296,7 +298,7 @@ describe('clearance analysis', () => {
         assert.equal(result.waypoints[1].flagged, true);
     });
 
-    test('follow: holds the waypoint clearance over rolling ground', () => {
+    test('follow: keeps at least the waypoint clearance over rolling ground, and goes down into its valleys', () => {
         const ground = (d) => 400 + 30 * Math.sin(d / 400);
         const route = northRoute([
             { atM: 0, altAmslM: ground(0) + 90 },
@@ -306,10 +308,17 @@ describe('clearance analysis', () => {
         const terrainM = terrainAlong(sampling, ground);
         const result = analyseClearance({ route, sampling, terrainM, globalMinM: 60, params });
 
+        // The valleys are 1250 m wide, the line looks 360 m ahead (20 s at 18 m/s): it comes
+        // down into them, later than the ground does, and is back up before the next rise
+        let lowestAlt = Infinity;
+        let highestAlt = -Infinity;
         for (let k = 20; k < sampling.samples.length; k++) {
             assert.equal(result.reason[k], AltitudeReason.FOLLOW);
-            assert.ok(Math.abs(result.clearanceM[k] - 90) < 6, `sample ${k}: clearance ${result.clearanceM[k]}`);
+            assert.ok(result.clearanceM[k] > 88 && result.clearanceM[k] < 110, `sample ${k}: clearance ${result.clearanceM[k]}`);
+            lowestAlt = Math.min(lowestAlt, result.altM[k]);
+            highestAlt = Math.max(highestAlt, result.altM[k]);
         }
+        assert.ok(highestAlt - lowestAlt > 45, `the altitude follows the 60 m of the ground: ${lowestAlt} to ${highestAlt}`);
         assert.equal(result.belowRanges.length, 0);
         assert.equal(result.legs[1].mode, TerrainMode.FOLLOW);
     });
@@ -410,24 +419,41 @@ describe('clearance analysis', () => {
 describe('terrain target and the altitude controller', () => {
     const near = (a, b, tolerance = 1e-9) => Math.abs(a - b) <= tolerance;
 
-    test('the lag of a rising target, and the leads that cancel it', () => {
+    test('the lag of a rising target, and the lead of the line that cancels it', () => {
         assert.ok(near(lagM(10, 0.4), 25), 'a target rising 10 m/s leaves the aircraft 25 m under it');
-        assert.equal(plannedLeadM(0, 10, 0.4), 0);
-        assert.equal(plannedLeadM(-3, 10, 0.4), 0);
-        assert.ok(near(plannedLeadM(5, 10, 0.4), 12.5), 'fades in over the first 10 m the look-ahead asks for');
-        assert.ok(near(plannedLeadM(90, 10, 0.4), 25));
-        assert.ok(near(measuredLeadM(8, 20, 0.4), 20));
-        assert.equal(measuredLeadM(-9, 20, 0.4), 0);
-        assert.ok(near(measuredLeadM(30, 20, 0.4), 50), "no more than the lag of the controller's fastest climb");
+        assert.ok(near(lineTargetM(520, 4, 0.4), 530), 'the line raised by the lag of its rise');
+        assert.equal(lineTargetM(520, 0, 0.4), 520);
+        assert.equal(lineTargetM(520, -3, 0.4), 520, 'a line coming down has no lead');
+        // The rise is smoothed over 1 s: a line that starts rising 5 m/s reads 5 m/s after a few seconds
+        let rise = 0;
+        let z = 500;
+        for (let i = 0; i < 50; i++) {
+            rise = lineRiseMs(rise, z, z + 0.5, 0.1, 20);
+            z += 0.5;
+        }
+        assert.ok(near(rise, 5, 0.1), `rise after 5 s ${rise}`);
+        assert.ok(near(lineRiseMs(0, 500, 530, 0.1, 20), 20 * 0.1 / 1.1), "a step counts no faster than the controller's fastest climb");
+        assert.equal(lineRiseMs(3, 500, 400, 0, 20), 3, 'no time passed, no change');
     });
 
-    test('the target with its leads, the climb line and the descent limit', () => {
+    test('the line: its rate, what it is never under, and the descent limit', () => {
         assert.equal(climbLineM(400, 60, 10, 50), 520);
-        assert.equal(leadTargetM(520, false, 9999, 25, 6), 526);
-        assert.equal(leadTargetM(520, true, 510, 25, 6), 535);
-        assert.equal(leadTargetM(520, true, 490, 25, 6), 526);
-        assert.equal(leadTargetM(520, true, 521, 2.5, 50), 570, 'the measured lead goes on the held height, never on the climb line');
-        assert.equal(leadTargetM(520, true, 560, 25, 50), 585);
+        // Up: the slope to the point in view that needs the steepest line, at 30 m/s
+        assert.ok(near(lineRateMs(true, 0.1, 30, 60, true, 10, 20), 3));
+        assert.equal(lineRateMs(true, 1, 30, 60, true, 10, 20), 20, "no faster than the controller's fastest climb");
+        assert.equal(lineRateMs(false, 0.1, 30, 60, true, 10, 20), 0, 'no answer: level');
+        // Down: every point in view lower, toward the highest of them, eased over the last metres
+        assert.equal(lineRateMs(true, -0.01, 30, 60, true, 10, 20), -10);
+        assert.equal(lineRateMs(true, -0.01, 30, 20, true, 10, 20), -4);
+        assert.equal(lineRateMs(true, -0.01, 30, 0, true, 10, 20), 0);
+        assert.equal(lineRateMs(true, -0.01, 30, 60, false, 10, 20), 0, 'a point in view without data: not down');
+        // One step of 0.1 s: held height at 150 m, minimum + margin at 140 m
+        assert.ok(near(lineAdvanceM(200, 3, 0.1, 150, 10, 140, false, 0), 200.3));
+        assert.ok(near(lineAdvanceM(145, 0, 0.1, 150, 10, 140, false, 0), 146), 'under the held height it rises to it at the planned rate');
+        assert.equal(lineAdvanceM(120, -10, 0.1, 150, 10, 140, false, 0), 140, 'never under minimum + margin');
+        assert.equal(lineAdvanceM(150, 0, 0.1, 150, 10, 140, true, 165), 165, "never under the look-ahead's climb line");
+        assert.equal(lineAdvanceM(150, 0, 0.1, 150, 10, 140, false, 165), 150);
+        assert.equal(lineNextExtraM(121, 120, 10), 9, "past the waypoint the line is aimed at the next leg's minimum + margin");
         assert.equal(limitDescentM(450, 550, 10, 0.4), 525);
         assert.equal(limitDescentM(540, 550, 10, 0.4), 540);
         assert.equal(limitDescentM(580, 550, 10, 0.4), 580);
