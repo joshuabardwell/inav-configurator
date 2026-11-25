@@ -5712,6 +5712,33 @@
     "missionTurnClearanceFloor": {
         "message": "The turn at this point crosses higher ground than the legs do. The terrain leg's floor keeps it clear; without terrain data on the card it would be $1 m over it, under the $2 m minimum."
     },
+    "missionTerrainTipWaypoint": {
+        "message": "Terrain warning at WP $1."
+    },
+    "missionTerrainTipWaypointLow": {
+        "message": "The waypoint itself is $1 m over the ground, under the $2 m minimum."
+    },
+    "missionTerrainTipWaypointLeg": {
+        "message": "The leg flown to it comes too close to the ground (red line)."
+    },
+    "missionTerrainTipWaypointTurn": {
+        "message": "The turn at it crosses ground it does not clear (red ring)."
+    },
+    "missionTerrainTipSelect": {
+        "message": "Click the waypoint for details."
+    },
+    "missionTerrainTipBelow": {
+        "message": "Too low on the leg to WP $1: the predicted path comes within $2 m of the ground, under the $3 m minimum."
+    },
+    "missionTerrainTipFallback": {
+        "message": "Leg to WP $1: only the terrain mode keeps this stretch clear. Stock firmware, or a flight without terrain data on the card, would come within $2 m of the ground here, under the $3 m minimum."
+    },
+    "missionTerrainTipTurnLow": {
+        "message": "Highest ground the turn at WP $1 may cross. The plane passes $2 m over it, under the $3 m minimum."
+    },
+    "missionTerrainTipTurnFloor": {
+        "message": "Highest ground the turn at WP $1 may cross. The terrain leg's floor keeps the turn clear; without terrain data on the card it would pass $2 m over it, under the $3 m minimum."
+    },
     "missionLegClearanceUnknown": {
         "message": "Leg to this point: ground distance not known (no terrain data, or an altitude relative to home without a home position)."
     },
