@@ -2040,8 +2040,9 @@ OSD.constants = {
                     name: 'VTX_CHANNEL',
                     id: 10,
                     positionable: true,
+                    // With a vtxtable the firmware shows the 3-character power label
                     preview: function(osd_data) {
-                        return 'CH:F7:1';
+                        return 'CH:F7:200';
                     },
                 },
                 {
