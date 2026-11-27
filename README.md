@@ -1,5 +1,13 @@
 # INAV Configurator
 
+> **This is "INAV Configurator JB", a test fork, not an official release.** It goes with
+> [JB's INAV 10 firmware fork](https://github.com/joshuabardwell/inav) and adds per-waypoint
+> terrain options to the mission planner, offline terrain data, and a VTX table editor. No
+> installers are published: you build it yourself from the `jb/build` branch.
+> **[What is different, how to build it, how to report results](JB-FORK.md)**
+>
+> The rest of this file is upstream's.
+
 INAV Configurator is a cross-platform configuration tool for the [INAV](https://github.com/iNavFlight/inav) flight control system.
 
 Various types of aircraft are supported by the tool and by INAV, e.g. quadcopters, hexacopters, octocopters, and fixed-wing aircraft.
